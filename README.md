@@ -158,3 +158,9 @@ Without `--enable-features=Vulkan --use-vulkan=swiftshader` the swap-chain share
 created in headless mode and the device is lost after a couple of frames. Override flags with
 `CHROME_GPU_FLAGS=...` and the browser with `CHROME=/path/to/chrome`. Frame rates in this mode are
 CPU-rendered and meaningless for performance.
+
+## License
+
+The engine source code is released under the [MIT License](LICENSE).
+
+The bundled sample model `public/DamagedHelmet.glb` is not covered by that license. It comes from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet) repository and is licensed under CC BY 4.0 by its original author; see that page for attribution details.
