@@ -8,11 +8,12 @@
     "dev": "vite",
     "build": "npm run typecheck && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tools/bake",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tools/bake && tsc --noEmit -p tools/local",
     "screenshot": "node scripts/screenshot.mjs",
     "check:shaders": "node scripts/check-shader-variants.mjs",
     "bake": "tsx tools/bake/cli.ts",
-    "test": "tsx --test tools/bake/test/*.test.ts"
+    "test": "tsx --test tools/bake/test/*.test.ts tools/local/test/*.test.ts",
+    "local": "tsx tools/local/cli.ts"
   },
   "dependencies": {
     "wgpu-matrix": "^3.4.2"

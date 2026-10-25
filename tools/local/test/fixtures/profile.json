@@ -1,0 +1,81 @@
+{
+  "schema": "wgm-device-profile",
+  "version": 1,
+  "probedAt": "2026-10-25T17:07:04.942Z",
+  "probe": {
+    "name": "webgpu-engine-probe",
+    "version": "1.0.0",
+    "headless": true
+  },
+  "platform": {
+    "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.0.0 Safari/537.36",
+    "mobile": false,
+    "hardwareConcurrency": 8,
+    "deviceMemoryGB": 16,
+    "maxTouchPoints": 0
+  },
+  "display": {
+    "screenWidth": 800,
+    "screenHeight": 600,
+    "devicePixelRatio": 1,
+    "viewportWidth": 1280,
+    "viewportHeight": 800,
+    "colorGamut": "srgb",
+    "hdr": false
+  },
+  "gpu": {
+    "available": true,
+    "vendor": "google",
+    "architecture": "swiftshader",
+    "device": "",
+    "description": "",
+    "isFallbackAdapter": true,
+    "features": [
+      "bgra8unorm-storage",
+      "chromium-experimental-sampling-resource-table",
+      "chromium-experimental-timestamp-query-inside-passes",
+      "clip-distances",
+      "core-features-and-limits",
+      "depth-clip-control",
+      "depth32float-stencil8",
+      "float32-blendable",
+      "float32-filterable",
+      "indirect-first-instance",
+      "rg11b10ufloat-renderable",
+      "subgroup-size-control",
+      "subgroups",
+      "texture-component-swizzle",
+      "texture-compression-astc",
+      "texture-compression-astc-sliced-3d",
+      "texture-compression-bc",
+      "texture-compression-bc-sliced-3d",
+      "texture-compression-etc2",
+      "texture-compression-unaligned",
+      "timestamp-query"
+    ],
+    "limits": {
+      "maxTextureDimension2D": 8192,
+      "maxTextureArrayLayers": 256,
+      "maxBufferSize": 1073741824,
+      "maxStorageBufferBindingSize": 1073741824,
+      "maxUniformBufferBindingSize": 65536,
+      "maxVertexBuffers": 8,
+      "maxVertexAttributes": 16,
+      "maxBindGroups": 4,
+      "maxSampledTexturesPerShaderStage": 16,
+      "maxColorAttachments": 8,
+      "maxComputeWorkgroupStorageSize": 32768
+    },
+    "preferredCanvasFormat": "rgba8unorm",
+    "textureCompression": {
+      "bc": true,
+      "astc": true,
+      "etc2": true
+    }
+  },
+  "benchmark": {
+    "fillRateMPixPerSec": 90,
+    "ms": 92.7
+  },
+  "deviceClass": "software"
+}
