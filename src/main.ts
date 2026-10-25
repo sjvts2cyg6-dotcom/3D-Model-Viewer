@@ -26,7 +26,7 @@ function showError(err: unknown): void {
 
 async function main(): Promise<void> {
   const params = new URLSearchParams(location.search);
-  const modelUrl = params.get('model') ?? `${import.meta.env.BASE_URL}DamagedHelmet.glb`;
+  const modelUrl = params.get('model');
   const msaa = params.get('msaa') === '1' ? 1 : 4;
   const maxDpr = Number(params.get('dpr') ?? Infinity);
 
@@ -39,14 +39,18 @@ async function main(): Promise<void> {
   const camera = new PerspectiveCamera();
   const controls = new OrbitControls(canvas, camera);
 
-  hud.textContent = `loading ${modelUrl}…`;
-  const t0 = performance.now();
-  const model = await loadModel(renderer, modelUrl);
-  scene.add(model);
-  scene.update();
-  controls.frame(computeWorldBounds(scene.root));
-  controls.setAngles(0.5, 0.25);
-  const loadMs = performance.now() - t0;
+  let loadMs = 0;
+  if (modelUrl) {
+    hud.textContent = `loading ${modelUrl}…`;
+    const t0 = performance.now();
+    const model = await loadModel(renderer, modelUrl);
+    scene.add(model);
+    scene.update();
+    controls.frame(computeWorldBounds(scene.root));
+    controls.setAngles(0.5, 0.25);
+    loadMs = performance.now() - t0;
+  }
+  const hint = modelUrl ? `load ${loadMs.toFixed(0)} ms` : 'no model: add ?model=/path/to/file.glb to the URL';
 
   let fpsAccum = 0, fpsFrames = 0, fps = 0;
   const loop = new FrameLoop((dt) => {
@@ -62,7 +66,7 @@ async function main(): Promise<void> {
       hud.textContent =
         `${fps.toFixed(0)} fps  ${canvas.width}x${canvas.height}  MSAA ${msaa}x\n` +
         `draws ${s.drawCalls}  tris ${Math.round(s.triangles).toLocaleString()}  pipelines ${s.pipelineSwitches}\n` +
-        `load ${loadMs.toFixed(0)} ms`;
+        hint;
     }
   });
   loop.start();
