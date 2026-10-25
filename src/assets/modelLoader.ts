@@ -1,17 +1,36 @@
 /**
- * Turns a parsed glTF asset into GPU resources + a scene-graph subtree.
- * This is the only place that knows about both the glTF data model and the
- * renderer; a future baked-format loader would sit alongside it.
+ * Model entry point. `loadModel` fetches once and sniffs the bytes:
+ *   - .wgm (baked by tools/bake)  -> wgm/loader.ts (minimal CPU work)
+ *   - .glb / .gltf                -> gltf.ts + `instantiate` below (fallback path)
  */
 import { Node } from '../scene/node';
 import { defaultMaterialDesc, type GpuMaterial } from '../renderer/material';
 import type { GpuMesh } from '../renderer/mesh';
 import type { Renderer } from '../renderer/renderer';
-import { loadGltf, type GltfAsset } from './gltf';
+import { parseGltf, type GltfAsset } from './gltf';
+import { isWgm } from './wgm/format';
+import { instantiateWgm, type WgmLoadOptions } from './wgm/loader';
 
-export async function loadModel(renderer: Renderer, url: string): Promise<Node> {
-  const asset = await loadGltf(url);
-  return instantiate(renderer, asset, url.split('/').pop() ?? 'model');
+export interface ModelLoadOptions extends WgmLoadOptions {}
+
+export async function loadModel(renderer: Renderer, url: string, opts: ModelLoadOptions = {}): Promise<Node> {
+  const t0 = performance.now();
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`failed to fetch ${url} (${res.status} ${res.statusText})`);
+  const data = await res.arrayBuffer();
+  const name = url.split('/').pop()?.split('?')[0] ?? 'model';
+  if (opts.stats) Object.assign(opts.stats, { fetchMs: performance.now() - t0, fileBytes: data.byteLength });
+  if (isWgm(data)) {
+    if (opts.stats) opts.stats.format = 'wgm';
+    return instantiateWgm(renderer, data, name, opts);
+  }
+  if (opts.stats) opts.stats.format = 'gltf';
+  const t1 = performance.now();
+  const asset = await parseGltf(data, new URL(url, location.href));
+  const t2 = performance.now();
+  const root = instantiate(renderer, asset, name);
+  if (opts.stats) Object.assign(opts.stats, { parseMs: t2 - t1, totalInstantiateMs: performance.now() - t1 });
+  return root;
 }
 
 export function instantiate(renderer: Renderer, asset: GltfAsset, name = 'model'): Node {

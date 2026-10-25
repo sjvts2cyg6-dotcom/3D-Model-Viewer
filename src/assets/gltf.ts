@@ -128,12 +128,19 @@ const CHUNK_BIN = 0x004e4942;
 export async function loadGltf(url: string): Promise<GltfAsset> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`glTF: failed to fetch ${url} (${res.status} ${res.statusText})`);
-  const data = await res.arrayBuffer();
-  const baseUrl = new URL(url, location.href);
+  return parseGltf(await res.arrayBuffer(), new URL(url, location.href));
+}
 
+/** True if `data` starts with the GLB magic. */
+export function isGlb(data: ArrayBuffer): boolean {
+  return data.byteLength >= 12 && new DataView(data).getUint32(0, true) === GLB_MAGIC;
+}
+
+/** Parse an already-fetched .glb or .gltf; external buffers/images resolve against `baseUrl`. */
+export async function parseGltf(data: ArrayBuffer, baseUrl: URL): Promise<GltfAsset> {
   let json: GltfJson;
   let glbBin: ArrayBuffer | undefined;
-  if (data.byteLength >= 12 && new DataView(data).getUint32(0, true) === GLB_MAGIC) {
+  if (isGlb(data)) {
     ({ json, bin: glbBin } = parseGlb(data));
   } else {
     json = JSON.parse(new TextDecoder().decode(data)) as GltfJson;
