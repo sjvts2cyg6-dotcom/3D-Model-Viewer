@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebGPU Engine - device probe</title>
+    <link rel="icon" href="data:," />
+    <style>
+      body { margin: 0; padding: 16px; background: #101014; color: #cfd3dc; font: 14px/1.5 system-ui, sans-serif; }
+      h1 { font-size: 18px; margin: 0 0 8px; }
+      #status { margin: 8px 0 12px; color: #fff; }
+      table { border-collapse: collapse; margin-bottom: 12px; }
+      th { text-align: left; padding: 2px 12px 2px 0; color: #8a90a0; font-weight: normal; }
+      pre { background: #0a0a0d; padding: 8px; border-radius: 4px; overflow: auto; max-height: 50vh; font-size: 12px; }
+      a { color: #8fb8ff; }
+    </style>
+  </head>
+  <body>
+    <h1>Device probe</h1>
+    <p>Measures this device's WebGPU capabilities and screen so the asset baker can tailor models to it.</p>
+    <div id="status">Loading...</div>
+    <table id="summary"></table>
+    <a id="download" download="device-profile.json" style="display:none">Download device-profile.json</a>
+    <pre id="profile"></pre>
+    <script type="module" src="/src/probe/main.ts"></script>
+  </body>
+</html>
