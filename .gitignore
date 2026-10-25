@@ -1,3 +1,7 @@
 node_modules
 dist
 screenshot.png
+# local sample models, their baked outputs and render captures (never committed)
+test-assets/
+screenshots/
+*.wgm
