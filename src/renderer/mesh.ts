@@ -1,5 +1,6 @@
 import type { Vec3 } from 'wgpu-matrix';
 import type { GpuMaterial } from './material';
+import { F32_VERTEX_LAYOUT, type VertexLayout } from './vertexLayout';
 
 /** CPU-side geometry in the engine's canonical (non-interleaved) layout. */
 export interface PrimitiveData {
@@ -30,6 +31,13 @@ export interface GpuPrimitive {
   vertexBuffers: [position: GPUBuffer, normal: GPUBuffer, uv: GPUBuffer, tangent: GPUBuffer];
   /** Byte offsets into `vertexBuffers` (multiples of 4). */
   vertexOffsets: [number, number, number, number];
+  /** GPU formats of the four streams (selects the pipeline variant). */
+  vertexLayout: VertexLayout;
+  /**
+   * Position dequantization, applied in the vertex shader from the per-draw
+   * uniform: local = position * scale + offset. Absent = float32 positions.
+   */
+  positionTransform?: { scale: [number, number, number]; offset: [number, number, number] };
   indexBuffer: GPUBuffer;
   /** Byte offset into `indexBuffer` (multiple of the index size). */
   indexOffset: number;
@@ -67,6 +75,7 @@ export function createGpuPrimitive(device: GPUDevice, data: PrimitiveData, mater
       createBuffer(device, data.tangents, V, `${label} tan`),
     ],
     vertexOffsets: [0, 0, 0, 0],
+    vertexLayout: F32_VERTEX_LAYOUT,
     indexBuffer: createBuffer(device, data.indices, GPUBufferUsage.INDEX, `${label} idx`),
     indexOffset: 0,
     indexFormat: data.indices instanceof Uint16Array ? 'uint16' : 'uint32',

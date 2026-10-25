@@ -66,7 +66,7 @@ export class ForwardPass implements RenderPass {
 
     for (const { prim, slot, lod } of frame.drawList) {
       const m = prim.material;
-      const pipeline = pipelines.get(features, m.alphaMode, m.doubleSided);
+      const pipeline = pipelines.get(features, m.alphaMode, m.doubleSided, prim.vertexLayout);
       if (pipeline !== curPipeline) {
         pass.setPipeline(pipeline);
         curPipeline = pipeline;

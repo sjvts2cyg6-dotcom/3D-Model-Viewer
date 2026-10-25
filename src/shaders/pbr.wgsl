@@ -8,6 +8,11 @@
 //
 // Compile-time features (see renderer/features.ts, renderer/shaderPreprocessor.ts):
 //   SHADOWS – directional shadow map in group 0 (reserved; no ShadowPass yet).
+//   OCT_NORMAL / OCT_TANGENT – normal / tangent stream is octahedral snorm16x2
+//     (renderer/vertexLayout.ts); otherwise xyz(w) in any float/snorm format.
+// Vertex inputs are declared vec4f so one shader serves every GPU vertex
+// format (float32, float16, unorm16, snorm16, snorm8): the vertex fetch unit
+// converts, missing components read as (0, 0, 0, 1).
 // Group 0 binding map (renderer/pipelines.ts FRAME_BINDING):
 //   0 = Frame uniforms, 1 = shadow map (depth), 2 = shadow comparison sampler.
 // Materials (group 1) and per-draw data (group 2) never depend on features.
@@ -36,6 +41,8 @@ struct Material {
 struct Draw {
   model    : mat4x4f,
   normalMat: mat4x4f,
+  posScale : vec4f,    // xyz: position dequantization scale (1 for float32 positions)
+  posOffset: vec4f,    // xyz: position dequantization offset (0 for float32 positions)
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -55,11 +62,20 @@ struct Draw {
 @group(2) @binding(0) var<uniform> draw: Draw;
 
 struct VSIn {
-  @location(0) position: vec3f,
-  @location(1) normal  : vec3f,
-  @location(2) uv      : vec2f,
+  @location(0) position: vec4f,
+  @location(1) normal  : vec4f,
+  @location(2) uv      : vec4f,
   @location(3) tangent : vec4f,
 };
+
+// Octahedral unit-vector decode (matches tools/bake/quantize.ts octDecode).
+fn octDecode(e: vec2f) -> vec3f {
+  var v = vec3f(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+  let t = max(-v.z, 0.0);
+  v.x += select(t, -t, v.x >= 0.0);
+  v.y += select(t, -t, v.y >= 0.0);
+  return normalize(v);
+}
 
 struct VSOut {
   @builtin(position) clip: vec4f,
@@ -72,12 +88,26 @@ struct VSOut {
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
   var out: VSOut;
-  let world = draw.model * vec4f(in.position, 1.0);
+  let local = in.position.xyz * draw.posScale.xyz + draw.posOffset.xyz;
+  let world = draw.model * vec4f(local, 1.0);
+#if OCT_NORMAL
+  let nrm = octDecode(in.normal.xy);
+#else
+  let nrm = in.normal.xyz;
+#endif
+#if OCT_TANGENT
+  // y carries the bitangent sign: |y| = eps + (v*0.5+0.5)*(1-eps), eps = 1/32767.
+  let eps = 1.0 / 32767.0;
+  let ty = ((abs(in.tangent.y) - eps) / (1.0 - eps)) * 2.0 - 1.0;
+  let tan = vec4f(octDecode(vec2f(in.tangent.x, ty)), select(1.0, -1.0, in.tangent.y < 0.0));
+#else
+  let tan = in.tangent;
+#endif
   out.clip = frame.viewProj * world;
   out.worldPos = world.xyz;
-  out.normal = (draw.normalMat * vec4f(in.normal, 0.0)).xyz;
-  out.tangent = vec4f((draw.model * vec4f(in.tangent.xyz, 0.0)).xyz, in.tangent.w);
-  out.uv = in.uv;
+  out.normal = (draw.normalMat * vec4f(nrm, 0.0)).xyz;
+  out.tangent = vec4f((draw.model * vec4f(tan.xyz, 0.0)).xyz, tan.w);
+  out.uv = in.uv.xy;
   return out;
 }
 

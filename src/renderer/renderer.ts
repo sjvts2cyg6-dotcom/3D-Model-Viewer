@@ -1,13 +1,14 @@
 import type { GpuContext } from '../core/gpu';
 import type { PerspectiveCamera } from '../scene/camera';
 import type { Scene } from '../scene/scene';
+import type { VertexLayout } from './vertexLayout';
 import { resolveRendererConfig, type RendererConfig, type ResolvedRendererConfig } from './config';
 import { featuresFromConfig, type ShaderFeatures } from './features';
 import { screenSpaceLodSelector, type LodSelector, type LodSettings } from './lod';
 import { createGpuPrimitive, createBuffer, type GpuPrimitive, type PrimitiveData } from './mesh';
 import { MATERIAL_UNIFORM_SIZE, materialSortKey, packMaterialUniforms, type GpuMaterial, type MaterialDesc } from './material';
 import {
-  createSharedLayouts, DRAW_UNIFORM_SIZE, FRAME_BINDING, FRAME_LAYOUT, frameUniformSize, PipelineCache, pipelineKey,
+  createSharedLayouts, DRAW_LAYOUT, DRAW_UNIFORM_SIZE, FRAME_BINDING, FRAME_LAYOUT, frameUniformSize, PipelineCache, pipelineKey,
   type SharedLayouts,
 } from './pipelines';
 import { ForwardPass, type DrawItem, type FrameData, type PassContext, type RenderPass, type RenderStats } from './passes';
@@ -140,13 +141,18 @@ export class Renderer {
 
   /**
    * Bound in place of absent vertex streams (e.g. no UVs / tangents in a baked
-   * primitive). Robust buffer access clamps or zeroes out-of-range fetches,
-   * and every byte here is zero, so the shader reads 0 either way.
+   * primitive). Layouts from vertexLayout.ts give absent streams arrayStride 0,
+   * so every vertex reads the same (zero) element.
    */
   get zeroVertexBuffer(): GPUBuffer {
     return (this.zeroBuffer ??= this.device.createBuffer({ label: 'zero vertex stream', size: 64, usage: GPUBufferUsage.VERTEX }));
   }
   private zeroBuffer: GPUBuffer | null = null;
+
+  /** Build pipeline variants for a material + vertex layout ahead of the first frame. */
+  prewarmPipelines(material: { alphaMode: MaterialDesc['alphaMode']; doubleSided: boolean }, layout: VertexLayout): void {
+    this.pipelines.get(this.features, material.alphaMode, material.doubleSided, layout);
+  }
 
   getSampler(desc?: SamplerDesc): GPUSampler {
     return this.samplers.get(desc);
@@ -226,7 +232,20 @@ export class Renderer {
       const item = list[i];
       item.slot = i;
       this.drawStaging.set(item.node.worldMatrix, i * strideF);
-      this.drawStaging.set(item.node.normalMatrix, i * strideF + 16);
+      this.drawStaging.set(item.node.normalMatrix, i * strideF + DRAW_LAYOUT.normalMat);
+      const pt = item.prim.positionTransform;
+      const o = i * strideF;
+      if (pt) {
+        this.drawStaging[o + DRAW_LAYOUT.posScale] = pt.scale[0];
+        this.drawStaging[o + DRAW_LAYOUT.posScale + 1] = pt.scale[1];
+        this.drawStaging[o + DRAW_LAYOUT.posScale + 2] = pt.scale[2];
+        this.drawStaging[o + DRAW_LAYOUT.posOffset] = pt.offset[0];
+        this.drawStaging[o + DRAW_LAYOUT.posOffset + 1] = pt.offset[1];
+        this.drawStaging[o + DRAW_LAYOUT.posOffset + 2] = pt.offset[2];
+      } else {
+        this.drawStaging.fill(1, o + DRAW_LAYOUT.posScale, o + DRAW_LAYOUT.posScale + 3);
+        this.drawStaging.fill(0, o + DRAW_LAYOUT.posOffset, o + DRAW_LAYOUT.posOffset + 3);
+      }
     }
     if (list.length) device.queue.writeBuffer(this.drawBuffer, 0, this.drawStaging, 0, list.length * strideF);
 

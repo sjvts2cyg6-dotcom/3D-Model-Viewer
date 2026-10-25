@@ -81,10 +81,6 @@ export function pickTranscodeTarget(device: GPUDevice): TranscodeTarget {
   return 'rgba8';
 }
 
-/** Features to request at device creation so compressed targets are available. */
-export const TEXTURE_COMPRESSION_FEATURES: GPUFeatureName[] = [
-  'texture-compression-bc', 'texture-compression-astc', 'texture-compression-etc2',
-];
 
 export interface TranscodedTexture {
   format: GPUTextureFormat;

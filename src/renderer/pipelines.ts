@@ -2,10 +2,16 @@ import { pbrWgsl } from '../shaders';
 import { featureDefines, featureKey, type ShaderFeatures } from './features';
 import type { AlphaMode } from './material';
 import { preprocessWgsl } from './shaderPreprocessor';
+import { F32_VERTEX_LAYOUT, layoutShaderKey, type VertexLayout } from './vertexLayout';
 
 export const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
-/** model mat4 + normal mat4 */
-export const DRAW_UNIFORM_SIZE = 128;
+/**
+ * model mat4 + normal mat4 + position dequantization (posScale, posOffset):
+ * local = in.position.xyz * posScale.xyz + posOffset.xyz (identity for float32 positions).
+ */
+export const DRAW_UNIFORM_SIZE = 160;
+/** Float offsets inside one Draw uniform (must match pbr.wgsl `struct Draw`). */
+export const DRAW_LAYOUT = { model: 0, normalMat: 16, posScale: 32, posOffset: 36 } as const;
 
 /** Group 0 (per-frame / lighting) binding slots. Slots 1-2 are reserved for shadows. */
 export const FRAME_BINDING = {
@@ -79,15 +85,11 @@ export function createFrameLayout(device: GPUDevice, f: ShaderFeatures): GPUBind
 }
 
 /**
- * Vertex streams, one buffer per attribute. A depth-only pass (e.g. shadows)
- * can bind just slot 0 with `POSITION_ONLY_LAYOUT`.
+ * Unquantized vertex streams, one buffer per attribute (glTF path). Baked
+ * files use per-primitive layouts from vertexLayout.ts. A depth-only pass
+ * (e.g. shadows) can bind just slot 0 with the layout's `buffers[0]`.
  */
-export const VERTEX_LAYOUTS: GPUVertexBufferLayout[] = [
-  { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] },
-  { arrayStride: 12, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] },
-  { arrayStride: 8, attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x2' }] },
-  { arrayStride: 16, attributes: [{ shaderLocation: 3, offset: 0, format: 'float32x4' }] },
-];
+export const VERTEX_LAYOUTS: GPUVertexBufferLayout[] = F32_VERTEX_LAYOUT.buffers;
 export const POSITION_ONLY_LAYOUT: GPUVertexBufferLayout[] = [VERTEX_LAYOUTS[0]];
 
 export function pipelineKey(alphaMode: AlphaMode, doubleSided: boolean): string {
@@ -96,8 +98,8 @@ export function pipelineKey(alphaMode: AlphaMode, doubleSided: boolean): string 
 
 /**
  * Lazily creates and caches PBR pipelines keyed by
- * (shader feature set, alpha mode, culling). Shader modules and frame
- * layouts are cached per feature set.
+ * (shader feature set, vertex layout, alpha mode, culling). Shader modules are
+ * cached per (feature set + layout defines); frame layouts per feature set.
  */
 export class PipelineCache {
   private readonly modules = new Map<string, GPUShaderModule>();
@@ -122,14 +124,22 @@ export class PipelineCache {
     return l;
   }
 
-  shaderModule(f: ShaderFeatures): GPUShaderModule {
-    const fk = featureKey(f);
-    let m = this.modules.get(fk);
+  shaderModule(f: ShaderFeatures, layout: VertexLayout = F32_VERTEX_LAYOUT): GPUShaderModule {
+    const mk = [featureKey(f), layoutShaderKey(layout)].filter(Boolean).join('+');
+    let m = this.modules.get(mk);
     if (!m) {
-      m = this.device.createShaderModule({ label: `pbr [${fk || 'base'}]`, code: preprocessWgsl(pbrWgsl, featureDefines(f)) });
-      this.modules.set(fk, m);
+      m = this.device.createShaderModule({
+        label: `pbr [${mk || 'base'}]`,
+        code: preprocessWgsl(pbrWgsl, { ...featureDefines(f), ...layout.defines }),
+      });
+      this.modules.set(mk, m);
     }
     return m;
+  }
+
+  /** Number of distinct shader modules / pipelines built so far (diagnostics, tests). */
+  get counts(): { modules: number; pipelines: number } {
+    return { modules: this.modules.size, pipelines: this.pipelines.size };
   }
 
   private pipelineLayout(f: ShaderFeatures): GPUPipelineLayout {
@@ -145,16 +155,16 @@ export class PipelineCache {
     return l;
   }
 
-  get(f: ShaderFeatures, alphaMode: AlphaMode, doubleSided: boolean): GPURenderPipeline {
-    const key = `${featureKey(f)}/${pipelineKey(alphaMode, doubleSided)}`;
+  get(f: ShaderFeatures, alphaMode: AlphaMode, doubleSided: boolean, layout: VertexLayout = F32_VERTEX_LAYOUT): GPURenderPipeline {
+    const key = `${featureKey(f)}/${layout.key}/${pipelineKey(alphaMode, doubleSided)}`;
     let p = this.pipelines.get(key);
     if (p) return p;
-    const module = this.shaderModule(f);
+    const module = this.shaderModule(f, layout);
     const blend = alphaMode === 'BLEND';
     p = this.device.createRenderPipeline({
       label: `pbr ${key}`,
       layout: this.pipelineLayout(f),
-      vertex: { module, entryPoint: 'vs_main', buffers: VERTEX_LAYOUTS },
+      vertex: { module, entryPoint: 'vs_main', buffers: layout.buffers },
       fragment: {
         module,
         entryPoint: 'fs_main',

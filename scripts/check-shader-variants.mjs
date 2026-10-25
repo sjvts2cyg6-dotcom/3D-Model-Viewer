@@ -1,6 +1,7 @@
-// Compiles every shader feature variant and builds its pipelines on a real
-// (SwiftShader) WebGPU device, so disabled-by-default features such as
-// SHADOWS can't silently rot. Usage: npm run check:shaders
+// Compiles every shader feature variant x vertex-layout variant and builds its
+// pipelines on a real (SwiftShader) WebGPU device, so disabled-by-default
+// features such as SHADOWS, and the quantized vertex layouts written by the
+// baker, can't silently rot. Usage: npm run check:shaders
 import { createServer } from 'vite';
 import puppeteer from 'puppeteer-core';
 
@@ -23,21 +24,35 @@ try {
     const r = await import('/src/renderer/index.ts');
     const device = await (await navigator.gpu.requestAdapter()).requestDevice();
     const out = [];
+    // Vertex layouts: float32 (glTF path), the baker's default quantized layouts,
+    // the octahedral variants, the high-precision variants and absent streams.
+    const layouts = [
+      r.F32_VERTEX_LAYOUT,
+      r.vertexLayout({ position: 'unorm16x4', normal: 'snorm8x4', uv: 'unorm16x2', tangent: 'snorm8x4' }),
+      r.vertexLayout({ position: 'unorm16x4', normal: 'snorm16x4', uv: 'float16x2', tangent: 'snorm16x4' }),
+      r.vertexLayout({ position: 'unorm16x4', normal: 'snorm16x2', uv: 'unorm16x2', tangent: 'snorm16x2', octNormal: true, octTangent: true }),
+      r.vertexLayout({ position: 'unorm16x4', normal: 'snorm16x2', uv: null, tangent: null, octNormal: true }),
+      r.vertexLayout({ position: 'float32x3', normal: 'snorm8x4', uv: 'float32x2', tangent: null }),
+      r.vertexLayout({ position: 'unorm16x4', normal: 'snorm8x4', uv: null, tangent: null }),
+    ];
     for (const features of [{ shadows: false }, { shadows: true }]) {
       const cache = new r.PipelineCache(device, r.createSharedLayouts(device), 'rgba8unorm-srgb', 4);
-      const info = await cache.shaderModule(features).getCompilationInfo();
-      const errors = info.messages.filter((m) => m.type === 'error').map((m) => `${m.lineNum}:${m.linePos} ${m.message}`);
-      device.pushErrorScope('validation');
-      for (const mode of ['OPAQUE', 'MASK', 'BLEND']) for (const ds of [false, true]) cache.get(features, mode, ds);
-      r.createFrameLayout(device, features);
-      const v = await device.popErrorScope();
-      out.push({ variant: r.featureKey(features) || 'base', uniformBytes: r.frameUniformSize(features), compileErrors: errors, validation: v?.message ?? null });
+      for (const layout of layouts) {
+        const info = await cache.shaderModule(features, layout).getCompilationInfo();
+        const errors = info.messages.filter((m) => m.type === 'error').map((m) => `${m.lineNum}:${m.linePos} ${m.message}`);
+        device.pushErrorScope('validation');
+        for (const mode of ['OPAQUE', 'MASK', 'BLEND']) for (const ds of [false, true]) cache.get(features, mode, ds, layout);
+        r.createFrameLayout(device, features);
+        const v = await device.popErrorScope();
+        out.push({ variant: r.featureKey(features) || 'base', layout: layout.key, uniformBytes: r.frameUniformSize(features), compileErrors: errors, validation: v?.message ?? null });
+      }
+      out.push({ variant: r.featureKey(features) || 'base', summary: cache.counts });
     }
     return out;
   });
   for (const x of results) {
     console.log(JSON.stringify(x));
-    if (x.compileErrors.length || x.validation) failed = true;
+    if (x.compileErrors?.length || x.validation) failed = true;
   }
 } catch (e) {
   console.error(e);

@@ -1,7 +1,8 @@
 import { FrameLoop, initGpu, observeCanvasSize, WebGPUUnsupportedError } from './core';
 import { Renderer } from './renderer';
 import { PerspectiveCamera, Scene, computeWorldBounds } from './scene';
-import { loadModel, TEXTURE_COMPRESSION_FEATURES, type TranscodeTarget } from './assets';
+import { loadModel, type TranscodeTarget } from './assets';
+import { TEXTURE_COMPRESSION_FEATURES } from './renderer/textures';
 import { OrbitControls } from './controls';
 
 declare global {
@@ -38,11 +39,14 @@ async function main(): Promise<void> {
   // ?lod=N forces a level for every mesh; ?lodpx=E sets the pixel-error threshold.
   const lodParam = params.get('lod');
   const lodPx = Number(params.get('lodpx') ?? 1);
-  // ?tex=bc7|astc|etc2|rgba8 forces the KTX2 transcode target (default: best supported).
+  // ?tex=bc7|astc|etc2|rgba8 forces the transcode target of opt-in universal (KTX2) files.
   const texParam = params.get('tex') as TranscodeTarget | null;
+  // ?nocompression=1 creates the device without texture-compression features
+  // (to test the clear "re-bake for this device" error on native files).
+  const noCompression = params.get('nocompression') === '1';
 
   const gpu = await initGpu(canvas, {
-    optionalFeatures: TEXTURE_COMPRESSION_FEATURES,
+    optionalFeatures: noCompression ? [] : TEXTURE_COMPRESSION_FEATURES,
     onDeviceLost: (i) => showError(new Error(`GPU device lost: ${i.message || i.reason}`)),
   });
   observeCanvasSize(canvas, { maxTextureDimension: gpu.device.limits.maxTextureDimension2D, maxPixelRatio: maxDpr });

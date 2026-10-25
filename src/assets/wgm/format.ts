@@ -14,8 +14,10 @@
 
 /** "WGMB" read as a little-endian u32. */
 export const WGM_MAGIC = 0x424d4757;
-export const WGM_VERSION_MAJOR = 1;
+export const WGM_VERSION_MAJOR = 2;
 export const WGM_VERSION_MINOR = 0;
+/** Major versions this reader accepts (v1 files: float32 streams, KTX2 or RGBA8 textures). */
+export const WGM_READABLE_MAJORS: readonly number[] = [1, 2];
 export const WGM_HEADER_SIZE = 32;
 /** Alignment of the manifest end, the binary blob, and every section. */
 export const WGM_SECTION_ALIGN = 16;
@@ -24,15 +26,42 @@ export const WGM_STREAM_ALIGN = 4;
 
 /**
  * Vertex layout ids. A baked file names the layout it was written for and the
- * loader refuses layouts it cannot bind. `f32-split-v1` is the engine's
- * canonical layout: four non-interleaved streams
+ * loader refuses layouts it cannot bind.
+ *
+ * `f32-split-v1` (v1 files): four non-interleaved float32 streams
  *   loc0 position f32x3 (12 B), loc1 normal f32x3 (12 B),
  *   loc2 uv f32x2 (8 B),        loc3 tangent f32x4 (16 B, w = bitangent sign).
+ * `split-v2` (v2 files): the same four non-interleaved streams, but each stream
+ *   names its GPU vertex format (and optional `encoding`); quantized formats are
+ *   fetched and converted by the vertex-fetch hardware, nothing is decoded on the CPU.
  */
-export type WgmVertexLayout = 'f32-split-v1';
-export const WGM_VERTEX_LAYOUT: WgmVertexLayout = 'f32-split-v1';
+export type WgmVertexLayout = 'f32-split-v1' | 'split-v2';
+export const WGM_VERTEX_LAYOUT: WgmVertexLayout = 'split-v2';
+export type WgmStreamName = 'position' | 'normal' | 'uv' | 'tangent';
+/** Streams of v1 files (and v2 streams without `format`) use these formats. */
+export const WGM_F32_FORMATS = { position: 'float32x3', normal: 'float32x3', uv: 'float32x2', tangent: 'float32x4' } as const;
+/** @deprecated v1 strides; use streamStride(). */
 export const WGM_STREAM_STRIDE = { position: 12, normal: 12, uv: 8, tangent: 16 } as const;
-export type WgmStreamName = keyof typeof WGM_STREAM_STRIDE;
+
+/** Vertex formats a v2 file may use per stream (WebGPU GPUVertexFormat names). */
+export const WGM_STREAM_FORMATS = {
+  position: ['float32x3', 'unorm16x4', 'snorm16x4'],
+  normal: ['float32x3', 'snorm16x4', 'snorm8x4', 'snorm16x2'],
+  tangent: ['float32x4', 'snorm16x4', 'snorm8x4', 'snorm16x2'],
+  uv: ['float32x2', 'float16x2', 'unorm16x2'],
+} as const;
+export type WgmPositionFormat = (typeof WGM_STREAM_FORMATS.position)[number];
+export type WgmNormalFormat = (typeof WGM_STREAM_FORMATS.normal)[number];
+export type WgmTangentFormat = (typeof WGM_STREAM_FORMATS.tangent)[number];
+export type WgmUvFormat = (typeof WGM_STREAM_FORMATS.uv)[number];
+export type WgmVertexFormat = WgmPositionFormat | WgmNormalFormat | WgmTangentFormat | WgmUvFormat;
+
+const FORMAT_BYTES: Record<WgmVertexFormat, number> = {
+  float32x4: 16, float32x3: 12, float32x2: 8, float16x2: 4,
+  unorm16x4: 8, snorm16x4: 8, snorm8x4: 4, snorm16x2: 4, unorm16x2: 4,
+};
+/** Bytes per vertex of a vertex format (= the stream's array stride). */
+export function streamStride(format: WgmVertexFormat): number { return FORMAT_BYTES[format]; }
 
 export type WgmSectionName = 'vertex' | 'index' | 'texture';
 
@@ -60,11 +89,28 @@ export interface WgmLod {
   error: number;
 }
 
+/**
+ * A vertex stream. `format` defaults to the float32 format of the stream (v1).
+ * `encoding: 'oct'` (normal/tangent with format snorm16x2): octahedral unit
+ * vector, decoded in the vertex shader; for tangents the bitangent sign is
+ * folded into the second component (see FORMAT.md).
+ */
+export interface WgmStream extends WgmRange {
+  format?: WgmVertexFormat;
+  encoding?: 'oct';
+}
+
 export interface WgmPrimitive {
   material: number | null;
   vertexCount: number;
   /** Streams in the 'vertex' section. Absent uv/tangent = shader reads zeros. */
-  streams: { position: WgmRange; normal: WgmRange; uv?: WgmRange; tangent?: WgmRange };
+  streams: { position: WgmStream; normal: WgmStream; uv?: WgmStream; tangent?: WgmStream };
+  /**
+   * Dequantization of normalized position formats: local = q.xyz * scale + offset,
+   * with q in [0,1] (unorm16) or [-1,1] (snorm16). Absent = identity (float32).
+   * Shared by all primitives of a mesh, so seams inside a mesh cannot crack.
+   */
+  positionTransform?: { scale: [number, number, number]; offset: [number, number, number] };
   /** Range in the 'index' section holding all LOD levels back to back. */
   indices: WgmRange & { format: 'uint16' | 'uint32'; count: number };
   /** lods[0] is full detail; later entries are progressively coarser. */
@@ -86,10 +132,42 @@ export interface WgmSampler {
 
 /** How a texture's bytes are encoded. */
 export type WgmTextureEncoding =
-  /** A complete KTX2 file (Basis ETC1S or UASTC, mips included); transcoded at load. */
-  | 'ktx2'
+  /** GPU-native block formats: the mip chain in the exact bytes writeTexture takes (no CPU work). */
+  | 'bc7' | 'astc' | 'etc2'
   /** Raw RGBA8 mip chain, level 0 first, tightly packed rows (width*4 bytes). */
-  | 'rgba8';
+  | 'rgba8'
+  /**
+   * Opt-in "universal" mode (`--texture-format universal`): a complete KTX2 file
+   * (Basis ETC1S or UASTC, mips included). The ONLY encoding that is transcoded at load.
+   */
+  | 'ktx2';
+
+/** Native encodings (stored as GPU-ready levels). */
+export const WGM_NATIVE_ENCODINGS: readonly WgmTextureEncoding[] = ['bc7', 'astc', 'etc2', 'rgba8'];
+
+/** GPU feature a texture format needs, or null if it is always available. */
+export function requiredTextureFeature(format: string): 'texture-compression-bc' | 'texture-compression-astc' | 'texture-compression-etc2' | null {
+  if (format.startsWith('bc')) return 'texture-compression-bc';
+  if (format.startsWith('astc')) return 'texture-compression-astc';
+  if (format.startsWith('etc2') || format.startsWith('eac')) return 'texture-compression-etc2';
+  return null;
+}
+
+/** Block footprint of the texture formats .wgm files may contain. */
+export function textureBlockInfo(format: string): { blockWidth: number; blockHeight: number; bytesPerBlock: number } {
+  const astc = /^astc-(\d+)x(\d+)-/.exec(format);
+  if (astc) return { blockWidth: Number(astc[1]), blockHeight: Number(astc[2]), bytesPerBlock: 16 };
+  if (format.startsWith('bc7') || format.startsWith('bc3') || format.startsWith('etc2-rgba8')) return { blockWidth: 4, blockHeight: 4, bytesPerBlock: 16 };
+  if (format.startsWith('bc1') || format.startsWith('etc2-rgb8')) return { blockWidth: 4, blockHeight: 4, bytesPerBlock: 8 };
+  if (format.startsWith('rgba8')) return { blockWidth: 1, blockHeight: 1, bytesPerBlock: 4 };
+  throw new WgmFormatError(`unsupported texture format ${format}`);
+}
+
+/** Exact byte size of one level of a texture format (whole blocks). */
+export function textureLevelBytes(format: string, width: number, height: number): number {
+  const b = textureBlockInfo(format);
+  return Math.ceil(width / b.blockWidth) * Math.ceil(height / b.blockHeight) * b.bytesPerBlock;
+}
 
 export interface WgmTexture {
   name: string;
@@ -104,9 +182,15 @@ export interface WgmTexture {
   height: number;
   mipLevelCount: number;
   hasAlpha: boolean;
+  /**
+   * Native encodings: the WebGPU texture format of the levels, e.g.
+   * 'bc7-rgba-unorm-srgb', 'astc-6x6-unorm', 'etc2-rgb8unorm-srgb', 'rgba8unorm'.
+   * (v1 rgba8 files omit it; it follows from colorSpace.)
+   */
+  format?: string;
   /** Range in the 'texture' section. */
   data: WgmRange;
-  /** rgba8 only: per-level ranges relative to `data.byteOffset`. */
+  /** Native encodings: per-level ranges relative to `data.byteOffset`, level 0 first. */
   levels?: (WgmRange & { width: number; height: number })[];
 }
 
@@ -210,8 +294,8 @@ export function readWgm(data: ArrayBuffer | Uint8Array): WgmFile {
     fileByteLength: dv.getUint32(28, true),
   };
   const headerSize = dv.getUint32(8, true);
-  if (header.versionMajor !== WGM_VERSION_MAJOR) {
-    throw new WgmFormatError(`unsupported WGM major version ${header.versionMajor} (reader supports ${WGM_VERSION_MAJOR})`);
+  if (!WGM_READABLE_MAJORS.includes(header.versionMajor)) {
+    throw new WgmFormatError(`unsupported WGM major version ${header.versionMajor} (reader supports ${WGM_READABLE_MAJORS.join(', ')})`);
   }
   if (headerSize < WGM_HEADER_SIZE) throw new WgmFormatError(`bad header size ${headerSize}`);
   if (header.fileByteLength !== bytes.byteLength) {
@@ -261,9 +345,17 @@ function validateRanges(m: WgmManifest): void {
   };
   m.meshes.forEach((mesh, mi) => mesh.primitives.forEach((p, pi) => {
     const tag = `mesh ${mi} prim ${pi}`;
-    for (const k of Object.keys(WGM_STREAM_STRIDE) as WgmStreamName[]) {
-      check(p.streams[k], 'vertex', `${tag} ${k}`, p.vertexCount * WGM_STREAM_STRIDE[k]);
+    for (const k of Object.keys(WGM_F32_FORMATS) as WgmStreamName[]) {
+      const st = p.streams[k];
+      if (!st) continue;
+      const fmt = st.format ?? WGM_F32_FORMATS[k];
+      if (!(WGM_STREAM_FORMATS[k] as readonly string[]).includes(fmt)) throw new WgmFormatError(`${tag} ${k}: unsupported vertex format ${fmt}`);
+      if (st.encoding !== undefined && !(st.encoding === 'oct' && fmt === 'snorm16x2')) throw new WgmFormatError(`${tag} ${k}: bad encoding ${st.encoding}`);
+      if (fmt === 'snorm16x2' && st.encoding !== 'oct') throw new WgmFormatError(`${tag} ${k}: snorm16x2 requires encoding "oct"`);
+      check(st, 'vertex', `${tag} ${k}`, p.vertexCount * streamStride(fmt));
     }
+    const pf = p.streams.position.format ?? 'float32x3';
+    if (pf !== 'float32x3' && !p.positionTransform) throw new WgmFormatError(`${tag}: ${pf} positions need positionTransform`);
     const isize = p.indices.format === 'uint16' ? 2 : 4;
     check(p.indices, 'index', `${tag} indices`, p.indices.count * isize);
     for (const l of p.lods) {
@@ -272,7 +364,17 @@ function validateRanges(m: WgmManifest): void {
       }
     }
   }));
-  m.textures.forEach((t, i) => check(t.data, 'texture', `texture ${i}`));
+  m.textures.forEach((t, i) => {
+    check(t.data, 'texture', `texture ${i}`);
+    if (t.encoding === 'ktx2') return;
+    const format = t.format ?? (t.colorSpace === 'srgb' ? 'rgba8unorm-srgb' : 'rgba8unorm');
+    if (!t.levels?.length) throw new WgmFormatError(`texture ${i}: ${t.encoding} without levels`);
+    t.levels.forEach((l, li) => {
+      if (l.byteOffset + l.byteLength > t.data.byteLength) throw new WgmFormatError(`texture ${i} level ${li}: range exceeds texture data`);
+      const want = textureLevelBytes(format, l.width, l.height);
+      if (l.byteLength < want) throw new WgmFormatError(`texture ${i} level ${li}: ${l.byteLength} B < ${want} B for ${format} ${l.width}x${l.height}`);
+    });
+  });
 }
 
 // ------------------------------------------------------------------ writer
@@ -281,6 +383,8 @@ export interface WgmWriterInput {
   /** Manifest without `format`, `version` and `sections` (filled in here). */
   manifest: Omit<WgmManifest, 'format' | 'version' | 'sections'>;
   sections: Partial<Record<WgmSectionName, Uint8Array>>;
+  /** Write an older version header (tests of backward compatibility only). */
+  version?: [number, number];
 }
 
 const SECTION_ORDER: WgmSectionName[] = ['vertex', 'index', 'texture'];
@@ -300,7 +404,7 @@ export function writeWgm(input: WgmWriterInput): Uint8Array {
 
   const manifest: WgmManifest = {
     format: 'wgm',
-    version: [WGM_VERSION_MAJOR, WGM_VERSION_MINOR],
+    version: input.version ?? [WGM_VERSION_MAJOR, WGM_VERSION_MINOR],
     ...input.manifest,
     sections,
   };
@@ -312,8 +416,8 @@ export function writeWgm(input: WgmWriterInput): Uint8Array {
   const out = new Uint8Array(total);
   const dv = new DataView(out.buffer);
   dv.setUint32(0, WGM_MAGIC, true);
-  dv.setUint16(4, WGM_VERSION_MAJOR, true);
-  dv.setUint16(6, WGM_VERSION_MINOR, true);
+  dv.setUint16(4, manifest.version[0], true);
+  dv.setUint16(6, manifest.version[1], true);
   dv.setUint32(8, WGM_HEADER_SIZE, true);
   dv.setUint32(12, 0, true); // flags
   dv.setUint32(16, manifestPadded, true);

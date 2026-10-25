@@ -126,9 +126,14 @@ export class SamplerCache {
   }
 }
 
+/** GPU features that enable the compressed texture families (requested at device creation). */
+export const TEXTURE_COMPRESSION_FEATURES: GPUFeatureName[] = ['texture-compression-bc', 'texture-compression-astc', 'texture-compression-etc2'];
+
 /** Block footprint of the texture formats the asset loaders upload directly. */
 export function formatBlockInfo(format: GPUTextureFormat): { blockWidth: number; blockHeight: number; bytesPerBlock: number } {
-  if (format.startsWith('bc7') || format.startsWith('bc3') || format.startsWith('astc-4x4') || format.startsWith('etc2-rgba8')) {
+  const astc = /^astc-(\d+)x(\d+)-/.exec(format);
+  if (astc) return { blockWidth: Number(astc[1]), blockHeight: Number(astc[2]), bytesPerBlock: 16 };
+  if (format.startsWith('bc7') || format.startsWith('bc3') || format.startsWith('etc2-rgba8')) {
     return { blockWidth: 4, blockHeight: 4, bytesPerBlock: 16 };
   }
   if (format.startsWith('bc1') || format.startsWith('etc2-rgb8')) return { blockWidth: 4, blockHeight: 4, bytesPerBlock: 8 };

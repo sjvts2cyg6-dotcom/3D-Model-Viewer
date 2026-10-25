@@ -9,11 +9,20 @@ import type { GpuMesh } from '../renderer/mesh';
 import type { Renderer } from '../renderer/renderer';
 import { parseGltf, type GltfAsset } from './gltf';
 import { isWgm } from './wgm/format';
-import { instantiateWgm, type WgmLoadOptions } from './wgm/loader';
+import { instantiateWgm, pickNativeTextureFormat, type WgmLoadOptions } from './wgm/loader';
 
 export interface ModelLoadOptions extends WgmLoadOptions {}
 
+/**
+ * `url` may contain `{tex}` (files baked with `--texture-format each`): it is
+ * replaced by the best native format this device samples (bc7 | astc | etc2 | rgba8).
+ */
 export async function loadModel(renderer: Renderer, url: string, opts: ModelLoadOptions = {}): Promise<Node> {
+  if (/\{tex\}|%7Btex%7D/i.test(url)) {
+    const tex = pickNativeTextureFormat(renderer.device);
+    url = url.replace(/\{tex\}|%7Btex%7D/gi, tex);
+    if (opts.stats) opts.stats.resolvedUrl = url;
+  }
   const t0 = performance.now();
   const res = await fetch(url);
   if (!res.ok) throw new Error(`failed to fetch ${url} (${res.status} ${res.statusText})`);
