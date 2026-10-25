@@ -2,11 +2,15 @@
 
 A minimal, dependency-light **browser / WebGPU** rendering engine skeleton in TypeScript.
 It is the first of a family of per-platform engines: each runtime is tailored to its
-target, and a shared offline asset pipeline (later) bakes glTF into the format each
-runtime wants.
+target, and a shared offline asset pipeline (`tools/bake`) bakes glTF into the format each
+runtime wants (for this engine: the `.wgm` container, see [FORMAT.md](FORMAT.md)).
 
 Runtime dependency: [`wgpu-matrix`](https://github.com/greggman/wgpu-matrix) (math only).
-Dev tooling: Vite, TypeScript, `@webgpu/types`, `puppeteer-core` (only for the headless screenshot check).
+Runtime asset (lazy-loaded, only when a KTX2 texture is met): the Basis Universal transcoder
+(`public/basis/`, Apache-2.0, from [BinomialLLC/basis_universal](https://github.com/BinomialLLC/basis_universal)).
+Dev tooling: Vite, TypeScript, `@webgpu/types`, `puppeteer-core` (headless screenshots), and for the
+offline baker only: `@gltf-transform/*`, `meshoptimizer`, `mikktspace`, `ktx2-encoder` (Basis encoder
+wasm), `pngjs`, `jpeg-js`, `tsx`. None of the baker dependencies end up in the browser bundle.
 
 
 ## Running
@@ -18,10 +22,14 @@ npm run build      # type-check + production bundle in dist/
 npm run preview    # serve dist/
 npm run screenshot # headless Chrome + SwiftShader render -> screenshot.png (after build)
 npm run check:shaders # compile + validate every shader feature variant (incl. disabled ones)
+npm test           # baker / .wgm round-trip tests (node:test via tsx)
+npm run bake -- model.glb -o out/   # bake glTF -> out/model.wgm (see "Asset baking")
 ```
 
-URL options: `?model=/path/to/file.glb` (or `.gltf`), `?msaa=1` (disable 4x MSAA),
-`?dpr=1.5` (cap device pixel ratio, useful on phones to save fill-rate).
+URL options: `?model=/path/to/file.glb` (or `.gltf`, or a baked `.wgm`, detected by its magic
+bytes), `?msaa=1` (disable 4x MSAA), `?dpr=1.5` (cap device pixel ratio, useful on phones to save
+fill-rate), `?lod=N` (force LOD level N), `?lodpx=E` (LOD pixel-error threshold, default 1),
+`?tex=bc7|astc|etc2|rgba8` (force the KTX2 transcode target).
 
 Controls: drag to orbit, right/middle/shift-drag to pan, wheel to zoom.
 Touch: one finger orbits, two fingers pinch-zoom and pan.
@@ -40,8 +48,10 @@ src/
                passes/       RenderPass interface, ForwardPass (MSAA + depth), shadowPass.ts (design stub only)
                pipelines.ts  bind-group layouts, vertex layouts, pipeline cache (features x alpha mode x culling)
                material.ts   material description + uniform packing + sort keys
-               mesh.ts       GPU buffers for primitives (non-interleaved streams)
-               textures.ts   image upload, GPU mipmap generation, 1x1 defaults, sampler cache
+               mesh.ts       GPU buffers for primitives (non-interleaved streams, offsets, LOD levels)
+               lod.ts        LOD settings + screen-space error LOD selector
+               textures.ts   image upload, GPU mipmap generation, precomputed-mip / compressed upload,
+                             1x1 defaults, sampler cache
   scene/       node.ts       scene graph: TRS -> local/world/normal matrices with dirty flags
                camera.ts     perspective camera (WebGPU 0..1 depth)
                scene.ts      scene root, one directional light, hemisphere ambient
@@ -49,18 +59,23 @@ src/
                bounds.ts     AABB helpers (framing; later culling)
   assets/      gltf.ts       glTF 2.0 / GLB parser -> engine-neutral CPU data (no GPU calls)
                geometry.ts   generate missing normals / tangents, bounds
-               modelLoader.ts CPU data -> GPU resources + scene subtree
+               modelLoader.ts fetch once, sniff glTF/GLB vs .wgm, CPU data -> GPU resources + scene subtree
+               wgm/format.ts  .wgm reader/writer + types (shared with the baker; no DOM/Node APIs)
+               wgm/loader.ts  .wgm -> one vertex buffer, one index buffer, textures, materials, nodes
+               ktx2/transcoder.ts  lazy Basis transcoder, picks BC7 / ASTC / ETC2 / RGBA8 per device
   shaders/     pbr.wgsl      metallic-roughness PBR (GGX, Smith-GGX correlated, Schlick), ACES tonemap
                mipmap.wgsl   downsample blit
   controls/    orbit.ts      orbit camera on Pointer Events (mouse + touch + pinch), damped
   main.ts      demo app: init, load model, frame it, run loop, HUD
+tools/bake/    offline baker (Node, never bundled): cli.ts, bake.ts, prepare.ts, geometry.ts,
+               targets/ (profiles), textures/ (decode, mips, KTX2 encode), test/
 ```
 
 ### Key design choices
 
 - **Data flows one way:** `assets` parses into plain typed arrays + descriptors, `modelLoader`
-  is the only module that knows both glTF and the renderer. A future loader for the baked
-  format will sit beside it and skip parsing entirely.
+  is the only module that knows both glTF and the renderer. The baked-format loader
+  (`assets/wgm/loader.ts`) sits beside it and skips parsing entirely.
 - **Bind groups by update frequency:** group 0 = per frame (camera/light), group 1 = per
   material, group 2 = per draw. All per-draw matrices go into **one** uniform buffer, written
   with **one** `writeBuffer` per frame, and selected with dynamic offsets.
@@ -71,10 +86,11 @@ src/
   image is written to memory, which matters a lot on tile-based mobile GPUs.
 - **sRGB done by hardware:** the canvas is configured with an `*-srgb` view format; base color
   and emissive textures are uploaded as `rgba8unorm-srgb`, data textures as linear.
-- **Mipmaps generated on the GPU** at load time (a baked pipeline will ship them precomputed).
+- **Mipmaps generated on the GPU** at load time for glTF; baked files ship them precomputed.
 - **Non-interleaved vertex streams** (position / normal / uv / tangent) keep the loader simple
   and allow a depth-only pass to bind positions alone later.
 - **Tangents generated only when a normal map needs them**; missing normals are computed.
+  (glTF path: Lengyel-style at load time; baked path: MikkTSpace in the baker.)
 
 ## Extending the renderer / adding shadows later
 
@@ -124,29 +140,126 @@ TEXCOORD_0, TANGENT; uint8/16/32 indices (or none); interleaved, normalized and 
 accessors; node TRS or matrix; base color, metallic-roughness, normal, occlusion and emissive
 textures with samplers; alpha OPAQUE / MASK / BLEND; doubleSided; `KHR_materials_emissive_strength`.
 
+## Asset baking (`tools/bake`)
+
+```bash
+npm run bake -- <input.glb|.gltf> -o <outdir> [--target webgpu] [--lods N] [--texture-format auto|uastc|etc1s|rgba8]
+#   --lod-ratio 0.5  --lod-max-error 0.05  --max-texture-size 4096
+#   --etc1s-quality 192  --uastc-level 2  --[no-]uastc-rdo  --recompute-tangents  -q
+```
+
+Writes `<outdir>/<name>.wgm` and prints sizes, vertex/triangle counts, per-LOD triangles and timings.
+Load it with `?model=/path/to/name.wgm`. Container spec: [FORMAT.md](FORMAT.md).
+
+### Pipeline and target profiles
+
+```
+glTF --(@gltf-transform NodeIO)--> Document
+     --prepare.ts (shared)-------> dequantize, dedup, weld, normals only if missing,
+                                   MikkTSpace tangents where a normal map exists, prune
+     --TargetProfile.bake()------> platform package (.wgm for webgpu)
+```
+
+A **target profile** (`tools/bake/targets/types.ts`) is `{ id, description, fileExtension,
+textureFormats, defaults, bake(doc, ctx) }` registered in `targets/index.ts`. Shared work lives in
+`prepare.ts`, `geometry.ts` (meshoptimizer) and `textures/`; a profile decides the vertex layout,
+index width, texture codecs and container. Future engines (mobile native, desktop native) add a
+profile, e.g. `targets/vulkan-mobile.ts` with quantized interleaved vertices and ASTC-only
+textures, without touching the others. Only `webgpu` exists today.
+
+### What the `webgpu` target does
+
+- **Geometry:** weld/dedupe vertices, real MikkTSpace tangents (via `mikktspace`) only where a
+  normal map exists, drop tangents/UVs that no material uses, meshoptimizer vertex-cache +
+  vertex-fetch reorder, uint16 indices whenever `vertexCount <= 65536`.
+- **LODs:** optional chain (`--lods`, default 4 incl. LOD0) from `simplifyWithAttributes`
+  (normals + UVs weighted), each level ~`--lod-ratio` of the previous, stopping when
+  simplification stalls or exceeds `--lod-max-error`; levels share LOD0's vertices and are
+  cache-optimized themselves. Each level stores its error in mesh units.
+- **Vertex layout:** exactly the engine's pipeline layout (`f32-split-v1`: split float32 streams
+  position/normal/uv/tangent). No quantization yet: the shaders and pipeline cache assume
+  float32 streams, so a quantized layout is a roadmap item, not a hack.
+- **Dedup:** identical geometry (content hash) shared by several meshes is stored once;
+  identical (image, usage) textures are encoded once.
+- **Textures:** decoded (PNG/JPEG), padded/resized to multiples of 4 (max `--max-texture-size`),
+  full mip chain computed offline (sRGB-correct for colour, renormalized for normal maps), then
+  - `auto` (default): **KTX2/Basis** with **ETC1S** for colour (base colour, emissive) and
+    **UASTC + Zstd** for normal and ORM/data maps (RDO on data maps; off for normals);
+  - `uastc` / `etc1s`: force one codec for all textures;
+  - `rgba8`: raw RGBA8 mip chain (largest, zero runtime work).
+
+### Textures at runtime (status: implemented)
+
+KTX2 is real, not a stub: the baker encodes with the Basis Universal encoder (wasm, via
+`ktx2-encoder`), and the engine transcodes at load time with the official Basis transcoder
+(lazy-loaded from `public/basis/`, ~1 MB wasm, fetched only when a file contains KTX2 textures).
+The device is created with whichever of `texture-compression-bc`, `-astc`, `-etc2` the adapter
+offers, and the transcode target is picked in this order: **BC7 -> ASTC 4x4 -> ETC2 (ETC1
+for opaque ETC1S) -> uncompressed RGBA8**. Precomputed mips are uploaded level by level, with
+sRGB formats for colour textures. Override with `?tex=...`. Transcoding currently runs on the
+main thread.
+
+### LOD API
+
+`renderer.lod = { pixelError: 1, force: null }` (also via `RendererConfig.lod`). Each frame, the
+renderer projects each primitive's per-level error to pixels using the distance to its world
+bounding sphere and picks the coarsest level under `pixelError`. Replace the policy with
+`renderer.lodSelector = (prim, node, camera, viewportHeight, settings) => levelIndex`.
+glTF-loaded meshes have a single level. The HUD shows how many draws used a reduced level.
+
+### Testing the baker
+
+`npm test` runs `tools/bake/test/*.test.ts`: `.wgm` write/read round trip, rejection of corrupt
+files (magic, truncation, version, LOD and stream ranges), LOD invariants, and a full bake of a
+generated glTF in `rgba8` and `auto` modes (uint16 indices, unit MikkTSpace tangents with w = ±1,
+no tangents without a normal map, KTX2 identifiers, colour spaces).
+
+Visual check against the glTF path (sample models are git-ignored, never committed):
+
+```bash
+mkdir -p test-assets && cd test-assets   # e.g. Khronos glTF-Sample-Assets BoxTextured, DamagedHelmet,
+cd ..                                    #      MetalRoughSpheresNoTextures (.glb)
+npm run bake -- test-assets/DamagedHelmet.glb -o test-assets/baked
+npm run build
+ASSETS_DIR=test-assets HIDE_HUD=1 OUT=/tmp/a.png URL_QUERY="?model=/local/DamagedHelmet.glb" node scripts/screenshot.mjs
+ASSETS_DIR=test-assets HIDE_HUD=1 OUT=/tmp/b.png URL_QUERY="?model=/local/baked/DamagedHelmet.wgm&lod=0" node scripts/screenshot.mjs
+node scripts/compare-images.mjs /tmp/a.png /tmp/b.png /tmp/diff.png   # PSNR etc. + amplified diff
+```
+
+`ASSETS_DIR` is served at `/local/` by the preview server; `test-assets/`, `screenshots/`
+and `*.wgm` are in `.gitignore`.
+
 ## Known gaps (deliberate for a skeleton)
 
 - One sampler per material (taken from its first texture); TEXCOORD_1 and `KHR_texture_transform` ignored.
-- No animation, skinning, morph targets, cameras or lights from glTF; no Draco/meshopt; KTX2 not yet.
+- No animation, skinning, morph targets, cameras or lights from glTF; no Draco/meshopt
+  decoding in the glTF path. The baker warns about and drops animation/skins, TEXCOORD_1 and
+  vertex colours; KTX2 is supported only through baked `.wgm` files (not `KHR_texture_basisu` in glTF).
 - BLEND materials are drawn after opaques but not sorted back-to-front.
 - No frustum culling or instancing yet; draw list is rebuilt every frame.
 - Ambient is a hemisphere term + analytic env-BRDF, not image-based lighting; no shadows yet (architecture ready, see above).
-- Tangent generation is Lengyel-style, not full MikkTSpace (the baker should emit MikkTSpace tangents).
+- glTF-path tangent generation is Lengyel-style; use baked files for exact MikkTSpace tangents.
+- Basis transcoding runs on the main thread; Basis encoding in the baker is slow (tens of
+  seconds per 2K texture). UASTC files are large on disk (their win is GPU memory/bandwidth).
+- LOD selection has no hysteresis; LODs simplify each primitive independently (no cross-mesh merging).
 
 ## Roadmap
 
-1. **KTX2 / Basis Universal textures:** transcode to ASTC (mobile), BC7 (desktop) or ETC2 at load
-   time based on `adapter.features` (`texture-compression-astc` / `-bc` / `-etc2`); precomputed mips.
-2. **LODs:** per-mesh LOD chains (meshoptimizer simplification in the baker), selected by projected
-   screen-space size, with hysteresis.
-3. **Frustum culling:** world AABB per node (already computed for framing) tested against camera planes;
-   later a BVH and GPU-driven culling with indirect draws.
-4. **Instancing:** batch identical (mesh, material) pairs into one `drawIndexed(count, instances)` with
-   per-instance transforms in a storage buffer.
-5. **Asset baking pipeline (shared across engines):** glTF in -> per-platform packages out: quantized
-   and interleaved vertex layouts, meshopt-optimized index order, MikkTSpace tangents, LODs,
-   GPU-compressed textures, a tiny binary header the runtime can map straight into GPU buffers.
-6. Then: opt-in shadow maps (`ShadowPass`), IBL (prefiltered env + BRDF LUT baked offline),
+Done: KTX2/Basis textures with BC7/ASTC/ETC2/RGBA8 transcoding, precomputed mips, meshopt LOD
+chains with screen-space selection, shared baking pipeline with target profiles, `.wgm` container.
+
+1. **Transcode in a Worker** (and stream textures progressively: low mips first).
+2. **Quantized vertex layouts:** e.g. snorm16 positions with a dequant matrix, oct-encoded
+   normals/tangents, unorm16 UVs, as a new `vertexLayout` id that becomes part of the pipeline
+   cache key; interleave where it helps.
+3. **Cheaper ETC1S transcodes:** BC1 for opaque colour maps on desktop (ETC1 is already used on ETC2 devices); per-texture codec heuristics.
+4. **Meshopt buffer compression** (`EXT_meshopt_compression`-style) for smaller downloads, decoded in a worker.
+5. **Frustum culling:** world AABB per node tested against camera planes; later a BVH and
+   GPU-driven culling with indirect draws. LOD hysteresis and per-node LOD.
+6. **Instancing:** batch identical (mesh, material) pairs (the baker already dedupes geometry)
+   into one `drawIndexed(count, instances)` with per-instance transforms in a storage buffer.
+7. **More bake targets** for the other engines (mobile/desktop native).
+8. Then: opt-in shadow maps (`ShadowPass`), IBL (prefiltered env + BRDF LUT baked offline),
    render bundles for static geometry, timestamp-query profiling.
 
 ## Headless screenshot notes
@@ -160,11 +273,13 @@ CPU-rendered and meaningless for performance.
 
 ## License
 
-The engine source code is released under the [MIT License](LICENSE).
+The engine source code is released under the [MIT License](LICENSE). The bundled Basis Universal
+transcoder in `public/basis/` is Apache-2.0 (see `public/basis/LICENSE`).
 
 ## Testing credits
 
 These sample models were used only to test the engine during development. They are **not included** in this repository, and the MIT license above does not apply to them.
 
 - **DamagedHelmet**, from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet) repository. © 2018 ctxwing (rebuild and conversion to glTF), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode); based on an earlier model © 2016 theblueturtle_, licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode).
+- **MetalRoughSpheresNoTextures**, from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/MetalRoughSpheresNoTextures) repository. © 2019 Kirill Gavrilov, released into the public domain under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/legalcode).
 - **BoxTextured**, from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/BoxTextured) repository. © 2017 Cesium, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode).
