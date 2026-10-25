@@ -27,10 +27,17 @@ export interface BakeOptions {
   uastcRdo: boolean;
   /** Regenerate tangents even when the source provides them. */
   recomputeTangents: boolean;
+  /**
+   * Full-detail triangle budget for the whole scene as drawn (instances counted);
+   * 0 = unlimited. Over budget, every primitive's LOD0 is simplified by the same ratio.
+   */
+  maxTriangles: number;
 }
 
 export interface BakeContext {
   options: BakeOptions;
+  /** Summary of the device profile the options were derived from (embedded in the output's stats). */
+  device?: Record<string, unknown>;
   log(msg: string): void;
   warn(msg: string): void;
 }

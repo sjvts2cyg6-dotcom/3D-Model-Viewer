@@ -14,5 +14,5 @@
     "isolatedModules": true,
     "allowImportingTsExtensions": false
   },
-  "include": ["./**/*.ts", "../../src/assets/wgm/format.ts"]
+  "include": ["./**/*.ts", "../../src/assets/wgm/format.ts", "../../src/probe/profile.ts"]
 }

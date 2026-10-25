@@ -26,14 +26,45 @@ export interface LodPolicy {
   levels: number;
   ratio: number;
   maxError: number;
+  /**
+   * Pre-reduction of the full-detail level (1 = keep the source triangles).
+   * Used for device triangle budgets; the reduced mesh becomes LOD0.
+   */
+  baseRatio?: number;
+}
+
+function attributeStream(normals: Float32Array, uvs: Float32Array | undefined, count: number) {
+  const stride = uvs ? 5 : 3;
+  const attrs = new Float32Array(count * stride);
+  for (let v = 0; v < count; v++) {
+    attrs.set(normals.subarray(v * 3, v * 3 + 3), v * stride);
+    if (uvs) attrs.set(uvs.subarray(v * 2, v * 2 + 2), v * stride + 3);
+  }
+  return { attrs, stride, weights: uvs ? [0.5, 0.5, 0.5, 1, 1] : [0.5, 0.5, 0.5] };
 }
 
 export async function optimizeGeometry(src: SourceGeometry, policy: LodPolicy): Promise<OptimizedGeometry> {
   await Promise.all([MeshoptEncoder.ready, MeshoptSimplifier.ready]);
   const vertexCountIn = src.positions.length / 3;
 
+  // 0. Optional budget reduction of the full-detail level (before the remap, so
+  //    vertices only the removed triangles used are dropped below).
+  let lod0: Uint32Array = src.indices.slice();
+  let baseError = 0;
+  const baseRatio = policy.baseRatio ?? 1;
+  if (baseRatio < 1 && lod0.length >= 3 * 16) {
+    const { attrs, stride, weights } = attributeStream(src.normals, src.uvs, vertexCountIn);
+    const target = Math.max(3, Math.floor((lod0.length * baseRatio) / 3) * 3);
+    const [out, relErr] = MeshoptSimplifier.simplifyWithAttributes(
+      lod0, src.positions, 3, attrs, stride, weights, null, target, 1, [],
+    );
+    if (out.length > 0 && out.length < lod0.length) {
+      lod0 = out;
+      baseError = relErr * MeshoptSimplifier.getScale(src.positions, 3);
+    }
+  }
+
   // 1. Vertex cache order + fetch remap on LOD0 (drops unreferenced vertices).
-  const lod0 = src.indices.slice();
   const [remap, unique] = MeshoptEncoder.reorderMesh(lod0, true, false);
   const permute = (a: Float32Array | undefined, n: number): Float32Array | undefined => {
     if (!a) return undefined;
@@ -51,16 +82,10 @@ export async function optimizeGeometry(src: SourceGeometry, policy: LodPolicy): 
   const tangents = permute(src.tangents, 4);
 
   // 2. LOD chain, always simplified from LOD0 so the reported error is absolute to the original.
-  const levels: { indices: Uint32Array; error: number }[] = [{ indices: lod0, error: 0 }];
+  const levels: { indices: Uint32Array; error: number }[] = [{ indices: lod0, error: baseError }];
   if (policy.levels > 1 && lod0.length >= 3 * 64) {
     const scale = MeshoptSimplifier.getScale(positions, 3);
-    const attrStride = uvs ? 5 : 3;
-    const attrs = new Float32Array(unique * attrStride);
-    for (let v = 0; v < unique; v++) {
-      attrs.set(normals.subarray(v * 3, v * 3 + 3), v * attrStride);
-      if (uvs) attrs.set(uvs.subarray(v * 2, v * 2 + 2), v * attrStride + 3);
-    }
-    const weights = uvs ? [0.5, 0.5, 0.5, 1, 1] : [0.5, 0.5, 0.5];
+    const { attrs, stride: attrStride, weights } = attributeStream(normals, uvs, unique);
     for (let l = 1; l < policy.levels; l++) {
       const prev = levels[levels.length - 1].indices;
       const target = Math.max(3, Math.floor((lod0.length * Math.pow(policy.ratio, l)) / 3) * 3);
@@ -69,7 +94,7 @@ export async function optimizeGeometry(src: SourceGeometry, policy: LodPolicy): 
       );
       // Stop when simplification stalls (hit the error cap) or degenerates.
       if (out.length === 0 || out.length > prev.length * 0.85) break;
-      levels.push({ indices: cacheOptimizeInPlaceIds(out), error: relErr * scale });
+      levels.push({ indices: cacheOptimizeInPlaceIds(out), error: Math.max(baseError, relErr * scale) });
     }
   }
 

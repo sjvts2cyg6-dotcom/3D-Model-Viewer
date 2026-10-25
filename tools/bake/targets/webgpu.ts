@@ -11,7 +11,7 @@
  * RGBA8 depending on device features. `--texture-format rgba8` writes a raw
  * pre-mipped RGBA8 chain instead (no transcoder needed, 4-8x larger).
  */
-import type { Document, Material, Primitive, Texture, TextureInfo } from '@gltf-transform/core';
+import type { Document, Material, Mesh, Primitive, Texture, TextureInfo } from '@gltf-transform/core';
 import { getBounds } from '@gltf-transform/functions';
 import { createHash } from 'node:crypto';
 import {
@@ -169,10 +169,11 @@ async function bakeWebgpu(doc: Document, ctx: BakeContext): Promise<BakeOutput> 
   // Primitives with identical geometry (common: one sphere/rock mesh reused with
   // different materials) share vertex streams and index ranges in the file.
   const geometryCache = new Map<string, Omit<WgmPrimitive, 'material'>>();
+  const baseRatio = triangleBudgetRatio(doc, opts.maxTriangles, ctx);
   for (const mesh of root.listMeshes()) {
     const primitives: WgmPrimitive[] = [];
     for (const prim of mesh.listPrimitives()) {
-      const p = await bakePrimitive(prim, materialList, vertex, index, geometryCache, ctx);
+      const p = await bakePrimitive(prim, materialList, vertex, index, geometryCache, ctx, baseRatio);
       if (!p) continue;
       primitives.push(p.prim);
       if (p.shared) { stats.sharedPrimitives++; continue; }
@@ -211,7 +212,7 @@ async function bakeWebgpu(doc: Document, ctx: BakeContext): Promise<BakeOutput> 
       generator: GENERATOR,
       vertexLayout: WGM_VERTEX_LAYOUT,
       nodes, roots, meshes, materials, textures, samplers, bounds,
-      stats: { ...finalStats, textureFormat: opts.textureFormat, lods: opts.lods },
+      stats: { ...finalStats, textureFormat: opts.textureFormat, lods: opts.lods, maxTriangles: opts.maxTriangles, ...(ctx.device ? { device: ctx.device } : {}) },
     },
     sections: { vertex: vertex.finish(), index: index.finish(), texture: texture.finish() },
   });
@@ -220,7 +221,7 @@ async function bakeWebgpu(doc: Document, ctx: BakeContext): Promise<BakeOutput> 
 
 async function bakePrimitive(
   prim: Primitive, materials: Material[], vertex: SectionBuilder, index: SectionBuilder,
-  cache: Map<string, Omit<WgmPrimitive, 'material'>>, ctx: BakeContext,
+  cache: Map<string, Omit<WgmPrimitive, 'material'>>, ctx: BakeContext, baseRatio: number,
 ): Promise<{ prim: WgmPrimitive; shared: boolean } | null> {
   const pos = prim.getAttribute('POSITION');
   const nrm = prim.getAttribute('NORMAL');
@@ -249,7 +250,7 @@ async function bakePrimitive(
 
   const g = await optimizeGeometry(
     { positions: f32(pos)!, normals: f32(nrm)!, uvs: uv, tangents: tan, indices },
-    { levels: ctx.options.lods, ratio: ctx.options.lodRatio, maxError: ctx.options.lodMaxError },
+    { levels: ctx.options.lods, ratio: ctx.options.lodRatio, maxError: ctx.options.lodMaxError, baseRatio },
   );
 
   const streams: WgmPrimitive['streams'] = {
@@ -281,6 +282,30 @@ async function bakePrimitive(
   };
   cache.set(key, geometry);
   return { prim: { ...geometry, material }, shared: false };
+}
+
+/** Triangles drawn at full detail (mesh instances counted) vs the budget -> uniform LOD0 ratio. */
+function triangleBudgetRatio(doc: Document, budget: number, ctx: BakeContext): number {
+  if (!budget || budget <= 0) return 1;
+  const instances = new Map<Mesh, number>();
+  for (const n of doc.getRoot().listNodes()) {
+    const m = n.getMesh();
+    if (m) instances.set(m, (instances.get(m) ?? 0) + 1);
+  }
+  let drawn = 0;
+  for (const [mesh, count] of instances) {
+    for (const prim of mesh.listPrimitives()) {
+      const idx = prim.getIndices();
+      drawn += ((idx ? idx.getCount() : prim.getAttribute('POSITION')?.getCount() ?? 0) / 3) * count;
+    }
+  }
+  if (drawn <= budget) {
+    ctx.log(`triangle budget ${budget}: scene draws ${Math.round(drawn)} triangles, no reduction`);
+    return 1;
+  }
+  const ratio = budget / drawn;
+  ctx.log(`triangle budget ${budget}: scene draws ${Math.round(drawn)} triangles, simplifying LOD0 to ${(ratio * 100).toFixed(1)}%`);
+  return ratio;
 }
 
 function hasAnyTexture(m: Material): boolean {
