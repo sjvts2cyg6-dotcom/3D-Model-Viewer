@@ -1,11 +1,13 @@
 /** Programmatic entry point: read a glTF/GLB, run a target profile, return the baked bytes. */
 import { NodeIO } from '@gltf-transform/core';
 import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
+import { DEFAULT_TOLERANCE } from './quantize';
 import { TARGETS, type BakeContext, type BakeOptions, type BakeOutput, type TargetProfile } from './targets';
 
 export const BASE_OPTIONS: BakeOptions = {
-  lods: 1, lodRatio: 0.5, lodMaxError: 0.05, textureFormat: 'auto', maxTextureSize: 4096,
-  etc1sQuality: 192, uastcLevel: 2, uastcRdo: true, recomputeTangents: false, maxTriangles: 0,
+  lods: 1, lodRatio: 0.5, lodMaxError: 0.05, textureFormat: 'auto', astcBlock: '4x4', astcQuality: 'medium', maxTextureSize: 4096,
+  etc1sQuality: 192, uastcLevel: 2, uastcRdo: false, zstd: false, recomputeTangents: false, maxTriangles: 0,
+  vertexPrecision: 'auto', normalEncoding: 'auto', vertexTolerance: { ...DEFAULT_TOLERANCE },
 };
 
 /** The input could not be read or parsed (CLI exit code 3). */

@@ -3,7 +3,10 @@
  * (src/probe, schema in src/probe/profile.ts and PROTOCOL.md); this module only
  * reads the data, it never measures anything itself.
  */
+import { readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { validateDeviceProfile, type DeviceProfile } from '../../src/probe/profile';
 import type { BakeOptions } from './targets';
 
@@ -20,8 +23,24 @@ export function parseDeviceProfile(text: string, origin: string): DeviceProfile 
   return v as DeviceProfile;
 }
 
+/** Built-in profiles (tools/bake/presets/*.json). Hand-written ESTIMATES of typical devices, not measurements. */
+export const PRESET_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'presets');
+export function listPresets(): string[] {
+  try { return readdirSync(PRESET_DIR).filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5)).sort(); } catch { return []; }
+}
+
+/**
+ * `file` is a path, `-` (stdin), `preset:<name>`, or a bare preset name
+ * (when no file of that name exists).
+ */
 export async function readDeviceProfile(file: string): Promise<DeviceProfile> {
   let text: string;
+  const presetName = file.startsWith('preset:') ? file.slice(7) : null;
+  if (presetName !== null || (file !== '-' && !file.includes('/') && !file.endsWith('.json') && listPresets().includes(file))) {
+    const name = presetName ?? file;
+    if (!listPresets().includes(name)) throw new DeviceProfileError(`unknown preset "${name}" (available: ${listPresets().join(', ')})`);
+    file = path.join(PRESET_DIR, `${name}.json`);
+  }
   if (file === '-') {
     const chunks: Buffer[] = [];
     for await (const c of process.stdin) chunks.push(c as Buffer);
@@ -39,6 +58,11 @@ const TRIANGLE_BUDGET: Record<DeviceProfile['deviceClass'], number> = {
 const DETAIL_SCALE: Record<DetailLevel, number> = { low: 0.25, medium: 1, high: 4, max: Infinity };
 /** Texture side relative to the longest physical screen side. */
 const TEXTURE_SCREEN_FACTOR: Record<DetailLevel, number> = { low: 0.5, medium: 1, high: 2, max: Infinity };
+
+/** Visible-error tolerances per detail level. */
+const PIXEL_TOLERANCE: Record<DetailLevel, number> = { low: 1, medium: 0.5, high: 0.25, max: 0.1 };
+const NORMAL_TOLERANCE_DEG: Record<DetailLevel, number> = { low: 1, medium: 0.5, high: 0.25, max: 0.05 };
+const UV_TOLERANCE_TEXELS: Record<DetailLevel, number> = { low: 0.5, medium: 0.25, high: 0.125, max: 0.0625 };
 
 const pow2ceil = (n: number) => 2 ** Math.ceil(Math.log2(Math.max(1, n)));
 
@@ -77,11 +101,34 @@ export function deriveOptions(p: DeviceProfile, detail: DetailLevel): DeviceDeri
   options.maxTriangles = Number.isFinite(budget) ? Math.round(budget) : 0;
   decisions.push(options.maxTriangles ? `triangle budget ${options.maxTriangles} (${cls}, detail ${detail})` : 'no triangle budget (detail max)');
 
-  // Texture codecs: KTX2 everywhere (smaller download, GPU-compressed when possible).
+  // Textures: a native GPU format the device samples directly (no transcode at load).
   const tc = p.gpu.textureCompression;
-  const runtime = tc.bc ? 'BC7' : tc.astc ? 'ASTC 4x4' : tc.etc2 ? 'ETC2' : 'RGBA8 (no GPU compression)';
-  options.textureFormat = 'auto';
-  decisions.push(`textures KTX2 auto; runtime will transcode to ${runtime}`);
+  if (!p.gpu.available) {
+    options.textureFormat = 'each';
+    decisions.push('textures: WebGPU unavailable in the probe, format support unknown -> one file per native format (each)');
+  } else if (tc.astc && (cls === 'mobile' || !tc.bc)) {
+    options.textureFormat = 'astc';
+    options.astcBlock = detail === 'low' ? '6x6' : '4x4';
+    decisions.push(`textures ASTC ${options.astcBlock} (device has ASTC${cls === 'mobile' ? ', mobile' : ''}; ${detail === 'low' ? '3.56' : '8'} bits/texel, uploaded as-is)`);
+  } else if (tc.bc) {
+    options.textureFormat = 'bc7';
+    decisions.push('textures BC7 (device has texture-compression-bc; 8 bits/texel, uploaded as-is)');
+  } else if (tc.etc2) {
+    options.textureFormat = 'etc2';
+    decisions.push('textures ETC2 (device has only texture-compression-etc2; uploaded as-is)');
+  } else {
+    options.textureFormat = 'rgba8';
+    decisions.push('textures RGBA8 (no GPU texture compression on this device)');
+  }
+
+  // Vertex precision: errors below what this screen can show at this detail level.
+  options.vertexTolerance = {
+    pixelError: PIXEL_TOLERANCE[detail],
+    screenPixels: Math.round(screenLong),
+    normalDegrees: NORMAL_TOLERANCE_DEG[detail],
+    uvTexels: UV_TOLERANCE_TEXELS[detail],
+  };
+  decisions.push(`vertex tolerance ${PIXEL_TOLERANCE[detail]} px at ${Math.round(screenLong)} px, normals ${NORMAL_TOLERANCE_DEG[detail]}°, UV ${UV_TOLERANCE_TEXELS[detail]} texel (detail ${detail})`);
 
   // LOD chain: keep the target default; software adapters benefit from coarser steps.
   if (cls === 'software') { options.lodRatio = 0.35; decisions.push('LOD ratio 0.35 (software adapter)'); }

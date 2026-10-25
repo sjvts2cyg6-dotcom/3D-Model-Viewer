@@ -8,9 +8,12 @@
 import { mkdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
-import { BakeInputError, bakeFile } from './bake';
+import { BASE_OPTIONS, BakeInputError, bakeFile } from './bake';
 import { DETAIL_LEVELS, DeviceProfileError, deriveOptions, readDeviceProfile, type DetailLevel } from './device';
 import { TARGETS, type BakeOptions, type TextureFormatOption } from './targets';
+import { ASTC_BLOCKS, NATIVE_FORMATS, type AstcBlock } from './textures/native';
+import { listPresets } from './device';
+import type { NormalEncoding, VertexPrecision } from './quantize';
 
 export const BAKE_PROTOCOL_VERSION = 1;
 
@@ -19,18 +22,32 @@ const HELP = `Usage: npm run bake -- <input.glb|input.gltf> [options]
 Options:
   -o, --out <dir>             output directory (default: next to the input)
   --target <id>               target profile (${Object.keys(TARGETS).join(', ')}; default webgpu)
-  --device <file|-|auto>      tailor to a DeviceProfile from the probe page: a JSON file,
-                              '-' = read it from stdin, 'auto' = run the probe in headless Chrome here
+  --device <file|-|auto|preset>
+                              tailor to a DeviceProfile from the probe page: a JSON file,
+                              '-' = read it from stdin, 'auto' = run the probe in headless Chrome here,
+                              or a built-in preset (estimates, not measurements): ${listPresets().join(', ')}
+                              (also as preset:<name>)
   --detail <level>            low | medium | high | max (default medium; used with --device)
   --max-triangles <N>         full-detail triangle budget for the drawn scene (0 = unlimited)
   --lods <N>                  total LOD levels incl. full detail (webgpu default 4; 1 = off)
   --lod-ratio <r>             index-count ratio between LODs (default 0.5)
   --lod-max-error <e>         stop LODs above this relative error (default 0.05)
-  --texture-format <f>        auto | uastc | etc1s | rgba8 (default auto)
+  --texture-format <f>        GPU-native, uploaded as-is (no decode/transcode at load):
+                                auto (from --device; BC7 without a profile) | bc7 | astc | etc2 | rgba8
+                                each = one file per native format: <name>.bc7.wgm, .astc.wgm, .etc2.wgm, .rgba8.wgm
+                              transcoded at load (opt-in only):
+                                universal = KTX2/Basis (ETC1S colour, UASTC data); uastc | etc1s force the codec
+  --astc-block <WxH>          ${ASTC_BLOCKS.join(' | ')} (default 4x4; 6x6 from a profile at --detail low)
+  --astc-quality <q>          fast | medium | thorough (default medium)
   --max-texture-size <px>     clamp the largest texture side (default 4096)
-  --etc1s-quality <1-255>     ETC1S quality (default 192)
-  --uastc-level <0-4>         UASTC effort (default 2)
-  --[no-]uastc-rdo            UASTC rate-distortion optimisation for data (ORM) maps (webgpu default on)
+  --vertex-precision <p>      auto = smallest GPU vertex formats within the device's visible tolerance (default)
+                              full = float32 streams; low = smallest formats regardless of error
+  --normal-encoding <e>       auto (snorm8/16 xyz) | oct (octahedral snorm16x2, decoded in the vertex shader)
+  --pixel-error <px>          position tolerance in screen pixels (default from --detail; 0.5 without a profile)
+  --uastc-level <0-4>         UASTC effort (BC7/ETC2 intermediate and universal; default 2)
+  --etc1s-quality <1-255>     universal only: ETC1S quality (default 192)
+  --[no-]uastc-rdo            universal only: UASTC rate-distortion optimisation (default off)
+  --zstd                      universal only: Zstd-supercompress UASTC (decompressed at load; default off)
   --recompute-tangents        regenerate MikkTSpace tangents even if present
   --print-device              resolve --device, print the full profile (JSON event "profile") and exit
                               without baking; input not required
@@ -46,13 +63,13 @@ class UsageError extends Error { override name = 'UsageError'; }
 
 interface Args {
   input: string; out?: string; target: string; quiet: boolean; json: boolean;
-  device?: string; detail: DetailLevel; printDevice: boolean; overrides: Partial<BakeOptions>;
+  device?: string; detail: DetailLevel; printDevice: boolean; overrides: Partial<BakeOptions>; pixelError?: number;
 }
 
 function parseArgs(argv: string[]): Args | 'help' {
   const overrides: Partial<BakeOptions> = {};
   let input: string | undefined, out: string | undefined, target = 'webgpu', quiet = false, json = false;
-  let device: string | undefined, detail: DetailLevel = 'medium', printDevice = false;
+  let device: string | undefined, detail: DetailLevel = 'medium', printDevice = false, pixelError: number | undefined;
   const val = (flag: string, v: string | undefined): string => {
     if (v === undefined) throw new UsageError(`${flag} expects a value`);
     return v;
@@ -79,6 +96,28 @@ function parseArgs(argv: string[]): Args | 'help' {
       case '--lod-ratio': overrides.lodRatio = num(a, argv[++i]); break;
       case '--lod-max-error': overrides.lodMaxError = num(a, argv[++i]); break;
       case '--texture-format': overrides.textureFormat = val(a, argv[++i]) as TextureFormatOption; break;
+      case '--astc-block': {
+        const b = val(a, argv[++i]) as AstcBlock;
+        if (!ASTC_BLOCKS.includes(b)) throw new UsageError(`--astc-block must be ${ASTC_BLOCKS.join(' | ')}`);
+        overrides.astcBlock = b; break;
+      }
+      case '--astc-quality': {
+        const q = val(a, argv[++i]);
+        if (q !== 'fast' && q !== 'medium' && q !== 'thorough') throw new UsageError('--astc-quality must be fast | medium | thorough');
+        overrides.astcQuality = q; break;
+      }
+      case '--vertex-precision': {
+        const v = val(a, argv[++i]) as VertexPrecision;
+        if (!['full', 'auto', 'low'].includes(v)) throw new UsageError('--vertex-precision must be full | auto | low');
+        overrides.vertexPrecision = v; break;
+      }
+      case '--normal-encoding': {
+        const v = val(a, argv[++i]) as NormalEncoding;
+        if (v !== 'auto' && v !== 'oct') throw new UsageError('--normal-encoding must be auto | oct');
+        overrides.normalEncoding = v; break;
+      }
+      case '--pixel-error': pixelError = num(a, argv[++i]); break;
+      case '--zstd': overrides.zstd = true; break;
       case '--max-texture-size': overrides.maxTextureSize = num(a, argv[++i]); break;
       case '--etc1s-quality': overrides.etc1sQuality = num(a, argv[++i]); break;
       case '--uastc-level': overrides.uastcLevel = num(a, argv[++i]); break;
@@ -96,7 +135,7 @@ function parseArgs(argv: string[]): Args | 'help' {
   }
   if (printDevice && !device) throw new UsageError('--print-device needs --device');
   if (!input && !printDevice) throw new UsageError('missing input file');
-  return { input: input ?? '', out, target, quiet, json, device, detail, printDevice, overrides };
+  return { input: input ?? '', out, target, quiet, json, device, detail, printDevice, overrides, pixelError };
 }
 
 const EXIT = { ok: 0, internal: 1, usage: 2, input: 3, device: 4, bake: 5 } as const;
@@ -145,37 +184,63 @@ async function main(): Promise<number> {
     }
   }
 
-  let result;
-  try {
-    result = await bakeFile(args.input, args.target, { ...derived, ...args.overrides }, { log: info, warn }, deviceSummary);
-  } catch (e) {
-    if (e instanceof BakeInputError || e instanceof DeviceProfileError) throw e;
-    if (/unknown target|does not support --texture-format/.test((e as Error).message)) throw new UsageError((e as Error).message);
-    throw Object.assign(e as Error, { bakeFailure: true });
+  const merged: Partial<BakeOptions> = { ...derived, ...args.overrides };
+  if (args.pixelError !== undefined) {
+    merged.vertexTolerance = { ...BASE_OPTIONS.vertexTolerance, ...derived.vertexTolerance, pixelError: args.pixelError };
   }
+  // `each`: one bake per native format, for targets whose formats are unknown.
+  const formats: (TextureFormatOption | null)[] = merged.textureFormat === 'each' ? [...NATIVE_FORMATS] : [null];
   const outDir = args.out ?? path.dirname(args.input);
   await mkdir(outDir, { recursive: true });
-  const outPath = path.join(outDir, path.basename(args.input).replace(/\.(glb|gltf)$/i, '') + result.target.fileExtension);
-  await writeFile(outPath, result.bytes);
-  const ms = Math.round(performance.now() - t0);
-  const s = result.stats as { vertices?: number; triangles?: number; lodTriangles?: number[] };
-  if (jsonMode) {
-    emit('result', {
+  const stem = path.basename(args.input).replace(/\.(glb|gltf)$/i, '');
+  const outputs: string[] = [];
+  let last: Record<string, unknown> | undefined;
+  for (const fmt of formats) {
+    let result;
+    try {
+      result = await bakeFile(args.input, args.target, fmt ? { ...merged, textureFormat: fmt } : merged, { log: info, warn }, deviceSummary);
+    } catch (e) {
+      if (e instanceof BakeInputError || e instanceof DeviceProfileError) throw e;
+      if (/unknown target|does not support --texture-format/.test((e as Error).message)) throw new UsageError((e as Error).message);
+      throw Object.assign(e as Error, { bakeFailure: true });
+    }
+    const outPath = path.join(outDir, stem + (fmt ? `.${fmt}` : '') + result.target.fileExtension);
+    await writeFile(outPath, result.bytes);
+    outputs.push(path.resolve(outPath));
+    const ms = Math.round(performance.now() - t0);
+    const s = result.stats as { vertices?: number; triangles?: number; lodTriangles?: number[]; vertexBytesF32?: number; vertexBytes?: number };
+    last = {
       output: path.resolve(outPath), inputBytes: inSize, outputBytes: result.bytes.byteLength, ms,
       target: result.target.id, options: result.options, stats: result.stats, device: deviceSummary ?? null,
-    });
-  } else {
-    const kib = (n: number) => `${(n / 1024).toFixed(1)} KiB`;
-    console.log(
-      `${path.basename(args.input)} -> ${outPath}  [${result.target.id}, textures ${result.options.textureFormat}]\n` +
-      `  ${kib(inSize)} -> ${kib(result.bytes.byteLength)}  verts ${s.vertices}  tris ${s.triangles}` +
-      `  LOD tris [${(s.lodTriangles ?? []).join(', ')}]  ${ms} ms`,
-    );
+    };
+    if (fmt) {
+      if (jsonMode) emit('output', last);
+    }
+    if (!jsonMode) {
+      const kib = (n: number) => `${(n / 1024).toFixed(1)} KiB`;
+      console.log(
+        `${path.basename(args.input)} -> ${outPath}  [${result.target.id}, textures ${String((result.stats as Record<string, unknown>).textureFormat ?? result.options.textureFormat)}]\n` +
+        `  ${kib(inSize)} -> ${kib(result.bytes.byteLength)}  verts ${s.vertices}  tris ${s.triangles}` +
+        `  vertex data ${s.vertexBytesF32 !== undefined ? `${kib(s.vertexBytesF32)} -> ${kib(s.vertexBytes ?? 0)}` : '?'}` +
+        `  LOD tris [${(s.lodTriangles ?? []).join(', ')}]  ${ms} ms`,
+      );
+    }
+  }
+  if (jsonMode && last) {
+    if (outputs.length > 1) {
+      // One summary event; `output` is a template the viewer resolves ({tex} -> best supported format).
+      emit('result', {
+        ...last, output: path.join(path.resolve(outDir), `${stem}.{tex}.wgm`), outputs,
+        options: { ...(last.options as object), textureFormat: 'each' },
+        outputBytes: undefined, stats: undefined,
+      });
+    } else emit('result', last);
   }
   return EXIT.ok;
 }
 
-const sourceOf = (device: string) => device === 'auto' ? 'headless' : device === '-' ? 'stdin' : 'file';
+const sourceOf = (device: string) => device === 'auto' ? 'headless' : device === '-' ? 'stdin'
+  : device.startsWith('preset:') || (!device.includes('/') && !device.endsWith('.json') && listPresets().includes(device)) ? 'preset' : 'file';
 
 async function resolveProfile(device: string, info: (m: string) => void) {
   if (device === 'auto') {

@@ -35,10 +35,22 @@ test('deriveOptions: class, screen, limits and detail drive texture size and tri
   assert.equal(d.options.maxTextureSize, 4096);
   assert.equal(d.options.maxTriangles, 2_000_000);
   assert.match(d.decisions.join('\n'), /BC7/);
+  assert.equal(d.options.textureFormat, 'bc7', 'desktop with BC -> native BC7, no transcoding');
+  assert.equal(d.options.vertexTolerance?.screenPixels, 2560);
+  assert.equal(d.options.vertexTolerance?.pixelError, 0.5);
   const m = deriveOptions(phone, 'medium');
   assert.equal(m.options.maxTextureSize, 2048, 'mobile capped at 2048 for medium');
   assert.equal(m.options.maxTriangles, 300_000);
   assert.match(m.decisions.join('\n'), /ASTC/);
+  assert.equal(m.options.textureFormat, 'astc');
+  assert.equal(m.options.astcBlock, '4x4');
+  assert.equal(deriveOptions(phone, 'low').options.astcBlock, '6x6', 'phone at low detail -> bigger ASTC blocks');
+  assert.equal(deriveOptions(variant((p) => { p.gpu.textureCompression = { bc: false, astc: false, etc2: true }; }), 'medium').options.textureFormat, 'etc2');
+  assert.equal(deriveOptions(variant((p) => { p.gpu.textureCompression = { bc: false, astc: false, etc2: false }; }), 'medium').options.textureFormat, 'rgba8');
+  assert.equal(deriveOptions(variant((p) => { p.gpu.available = false; }), 'medium').options.textureFormat, 'each', 'unknown formats -> one file per format');
+  assert.equal(deriveOptions(BASE, 'medium').options.textureFormat, 'bc7', 'SwiftShader (bc+astc+etc2, software) -> BC7');
+  assert.equal(deriveOptions(BASE, 'max').options.vertexTolerance?.normalDegrees, 0.05);
+  for (const d of m.decisions) assert.doesNotMatch(d, /transcode|KTX2/i, 'native formats: nothing is transcoded at load');
   assert.equal(deriveOptions(phone, 'low').options.maxTriangles, 75_000);
   assert.equal(deriveOptions(desktop, 'max').options.maxTriangles, 0, 'max = unlimited');
   const limited = variant((p) => { p.deviceClass = 'desktop'; p.gpu.limits.maxTextureDimension2D = 2048; p.platform.deviceMemoryGB = 8; });
@@ -90,4 +102,18 @@ test('CLI --json: events, --device - from stdin, flags override device, exit cod
   const res = b.events.find((e) => e.event === 'result');
   assert.equal(res.options.maxTextureSize, 300);
   assert.equal(res.device.deviceClass, BASE.deviceClass);
+});
+
+test('presets: built-in estimates resolve by name and are valid profiles', async () => {
+  const { readDeviceProfile, listPresets } = await import('../device');
+  assert.deepEqual(listPresets(), ['desktop-1080p', 'phone', 'phone-etc2']);
+  for (const name of listPresets()) {
+    const p = await readDeviceProfile(`preset:${name}`);
+    assert.deepEqual(validateDeviceProfile(p), []);
+    assert.match(p.probe.name, /estimate/);
+  }
+  assert.equal((await readDeviceProfile('desktop-1080p')).display.screenWidth, 1920);
+  await assert.rejects(readDeviceProfile('preset:nope'), DeviceProfileError);
+  assert.equal(deriveOptions(await readDeviceProfile('phone'), 'low').options.textureFormat, 'astc');
+  assert.equal(deriveOptions(await readDeviceProfile('phone-etc2'), 'medium').options.textureFormat, 'etc2');
 });

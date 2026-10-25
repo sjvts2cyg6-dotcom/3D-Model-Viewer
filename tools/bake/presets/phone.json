@@ -1,0 +1,67 @@
+{
+  "schema": "wgm-device-profile",
+  "version": 1,
+  "probedAt": "2026-10-25T00:00:00.000Z",
+  "probe": {
+    "name": "preset:phone (estimate, not measured)",
+    "version": "1.0.0",
+    "headless": false
+  },
+  "platform": {
+    "userAgent": "Mozilla/5.0 (Linux; Android 14; Pixel) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+    "mobile": true,
+    "hardwareConcurrency": 8,
+    "deviceMemoryGB": 4,
+    "maxTouchPoints": 5
+  },
+  "display": {
+    "screenWidth": 390,
+    "screenHeight": 844,
+    "devicePixelRatio": 3,
+    "viewportWidth": 390,
+    "viewportHeight": 844,
+    "colorGamut": "srgb",
+    "hdr": false
+  },
+  "gpu": {
+    "available": true,
+    "vendor": "arm",
+    "architecture": "valhall",
+    "device": "",
+    "description": "estimate: mid-range phone GPU",
+    "isFallbackAdapter": false,
+    "features": [
+      "core-features-and-limits",
+      "depth32float-stencil8",
+      "float32-filterable",
+      "indirect-first-instance",
+      "rg11b10ufloat-renderable",
+      "texture-compression-astc",
+      "texture-compression-etc2"
+    ],
+    "limits": {
+      "maxTextureDimension2D": 8192,
+      "maxTextureArrayLayers": 256,
+      "maxBufferSize": 268435456,
+      "maxStorageBufferBindingSize": 1073741824,
+      "maxUniformBufferBindingSize": 65536,
+      "maxVertexBuffers": 8,
+      "maxVertexAttributes": 16,
+      "maxBindGroups": 4,
+      "maxSampledTexturesPerShaderStage": 16,
+      "maxColorAttachments": 8,
+      "maxComputeWorkgroupStorageSize": 32768
+    },
+    "preferredCanvasFormat": "rgba8unorm",
+    "textureCompression": {
+      "bc": false,
+      "astc": true,
+      "etc2": true
+    }
+  },
+  "benchmark": {
+    "fillRateMPixPerSec": null,
+    "ms": null
+  },
+  "deviceClass": "mobile"
+}

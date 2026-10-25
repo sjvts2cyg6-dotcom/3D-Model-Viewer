@@ -1,0 +1,66 @@
+{
+  "schema": "wgm-device-profile",
+  "version": 1,
+  "probedAt": "2026-10-25T00:00:00.000Z",
+  "probe": {
+    "name": "preset:desktop-1080p (estimate, not measured)",
+    "version": "1.0.0",
+    "headless": false
+  },
+  "platform": {
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "mobile": false,
+    "hardwareConcurrency": 8,
+    "deviceMemoryGB": 8,
+    "maxTouchPoints": 0
+  },
+  "display": {
+    "screenWidth": 1920,
+    "screenHeight": 1080,
+    "devicePixelRatio": 1,
+    "viewportWidth": 1920,
+    "viewportHeight": 1080,
+    "colorGamut": "srgb",
+    "hdr": false
+  },
+  "gpu": {
+    "available": true,
+    "vendor": "nvidia",
+    "architecture": "ampere",
+    "device": "",
+    "description": "estimate: mid-range discrete GPU",
+    "isFallbackAdapter": false,
+    "features": [
+      "core-features-and-limits",
+      "depth32float-stencil8",
+      "float32-filterable",
+      "indirect-first-instance",
+      "rg11b10ufloat-renderable",
+      "texture-compression-bc"
+    ],
+    "limits": {
+      "maxTextureDimension2D": 16384,
+      "maxTextureArrayLayers": 256,
+      "maxBufferSize": 2147483648,
+      "maxStorageBufferBindingSize": 1073741824,
+      "maxUniformBufferBindingSize": 65536,
+      "maxVertexBuffers": 8,
+      "maxVertexAttributes": 16,
+      "maxBindGroups": 4,
+      "maxSampledTexturesPerShaderStage": 16,
+      "maxColorAttachments": 8,
+      "maxComputeWorkgroupStorageSize": 32768
+    },
+    "preferredCanvasFormat": "bgra8unorm",
+    "textureCompression": {
+      "bc": true,
+      "astc": false,
+      "etc2": false
+    }
+  },
+  "benchmark": {
+    "fillRateMPixPerSec": null,
+    "ms": null
+  },
+  "deviceClass": "desktop"
+}

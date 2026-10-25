@@ -13,12 +13,32 @@ import { Document, NodeIO } from '@gltf-transform/core';
 import { PNG } from 'pngjs';
 import {
   readWgm, writeWgm, isWgm, SectionBuilder, WgmFormatError, WGM_HEADER_SIZE, WGM_SECTION_ALIGN, WGM_VERTEX_LAYOUT,
-  type WgmManifest,
+  textureLevelBytes, type WgmManifest, type WgmStream,
 } from '../../../src/assets/wgm/format';
 import { optimizeGeometry } from '../geometry';
+import { fromHalf } from '../quantize';
 import { bakeFile } from '../bake';
 
 const quiet = { log() {}, warn() {} };
+
+/** Decode a vertex stream the way the GPU's vertex fetch does -> 4 floats per vertex (missing = 0,0,0,1). */
+function decodeStream(section: Uint8Array, s: WgmStream, n: number): Float32Array {
+  const fmt = s.format ?? (s.byteLength / n === 12 ? 'float32x3' : s.byteLength / n === 8 ? 'float32x2' : 'float32x4');
+  const comps = Number(fmt.slice(-1));
+  const buf = section.buffer.slice(section.byteOffset + s.byteOffset, section.byteOffset + s.byteOffset + s.byteLength);
+  const src = fmt.startsWith('float32') ? new Float32Array(buf) : fmt.startsWith('snorm8') ? new Int8Array(buf)
+    : fmt.startsWith('snorm16') ? new Int16Array(buf) : new Uint16Array(buf);
+  const out = new Float32Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 4; c++) {
+      if (c >= comps) { out[i * 4 + c] = c === 3 ? 1 : 0; continue; }
+      const x = src[i * comps + c];
+      out[i * 4 + c] = fmt.startsWith('float32') ? x : fmt.startsWith('float16') ? fromHalf(x)
+        : fmt.startsWith('snorm8') ? Math.max(x / 127, -1) : fmt.startsWith('snorm16') ? Math.max(x / 32767, -1) : x / 65535;
+    }
+  }
+  return out;
+}
 
 function sampleManifest(): Omit<WgmManifest, 'format' | 'version' | 'sections'> {
   return {
@@ -61,6 +81,50 @@ test('wgm round trip preserves manifest and section bytes', () => {
   assert.equal(f.section('texture').byteLength, 0);
   // Sections are zero-copy views into the input.
   assert.equal(v.buffer, bytes.buffer);
+});
+
+test('wgm v1 files (float32 streams, no formats) are still readable', () => {
+  const vertex = new SectionBuilder();
+  vertex.push(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]));
+  vertex.push(new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]));
+  const index = new SectionBuilder();
+  index.push(new Uint16Array([0, 1, 2]));
+  const bytes = writeWgm({
+    manifest: { ...sampleManifest(), vertexLayout: 'f32-split-v1' },
+    sections: { vertex: vertex.finish(), index: index.finish() }, version: [1, 0],
+  });
+  const f = readWgm(bytes);
+  assert.deepEqual(f.manifest.version, [1, 0]);
+  assert.equal(f.header.versionMajor, 1);
+  assert.equal(f.manifest.meshes[0].primitives[0].streams.position.format, undefined);
+  // An unknown future major is rejected with a clear message.
+  const future = writeWgm({ manifest: sampleManifest(), sections: { vertex: vertex.finish(), index: index.finish() }, version: [9, 0] });
+  assert.throws(() => readWgm(future), /unsupported WGM major version 9/);
+});
+
+test('wgm validation: quantized streams need matching sizes, formats and a position transform', () => {
+  const build = (mut: (m: ReturnType<typeof sampleManifest>) => void) => {
+    const m = sampleManifest();
+    mut(m);
+    const vertex = new SectionBuilder();
+    vertex.push(new Uint8Array(64));
+    const index = new SectionBuilder();
+    index.push(new Uint16Array([0, 1, 2]));
+    return writeWgm({ manifest: m, sections: { vertex: vertex.finish(), index: index.finish() } });
+  };
+  const ok = build((m) => {
+    const p = m.meshes[0].primitives[0];
+    p.streams = { position: { byteOffset: 0, byteLength: 24, format: 'unorm16x4' }, normal: { byteOffset: 24, byteLength: 12, format: 'snorm8x4' } };
+    p.positionTransform = { scale: [1, 1, 1], offset: [0, 0, 0] };
+  });
+  assert.equal(readWgm(ok).manifest.meshes[0].primitives[0].streams.normal.format, 'snorm8x4');
+  assert.throws(() => readWgm(build((m) => {
+    const p = m.meshes[0].primitives[0];
+    p.streams = { position: { byteOffset: 0, byteLength: 24, format: 'unorm16x4' }, normal: { byteOffset: 24, byteLength: 12, format: 'snorm8x4' } };
+  })), /positionTransform/);
+  assert.throws(() => readWgm(build((m) => {
+    m.meshes[0].primitives[0].streams.normal = { byteOffset: 36, byteLength: 12, format: 'snorm16x2' };
+  })), /oct/);
 });
 
 test('wgm reader rejects corrupt input', () => {
@@ -139,20 +203,39 @@ test('bake: generated glTF through the webgpu target reads back consistently', a
   const input = path.join(dir, 'grid.glb');
   await writeFile(input, await new NodeIO().writeBinary(doc));
 
-  for (const textureFormat of ['rgba8', 'auto'] as const) {
-    const res = await bakeFile(input, 'webgpu', { textureFormat, lods: 3 }, quiet);
+  for (const [textureFormat, vertexPrecision] of [['rgba8', 'full'], ['bc7', 'auto'], ['astc', 'auto'], ['etc2', 'low'], ['universal', 'auto']] as const) {
+    const res = await bakeFile(input, 'webgpu', { textureFormat, lods: 3, vertexPrecision }, quiet);
     const f = readWgm(res.bytes);
     const m = f.manifest;
     assert.equal(m.target, 'webgpu');
+    assert.equal(m.version[0], 2);
     assert.equal(m.meshes.length, 2);
     const p = m.meshes[0].primitives[0];
     assert.equal(p.indices.format, 'uint16');
     assert.ok(p.streams.uv && p.streams.tangent, 'normal-mapped primitive needs uv + tangent streams');
-    // MikkTSpace tangents: unit xyz, w = +-1.
     const v = f.section('vertex');
-    const tan = new Float32Array(v.buffer, v.byteOffset + p.streams.tangent.byteOffset, p.vertexCount * 4);
+    if (vertexPrecision === 'full') {
+      assert.equal(p.streams.position.format, 'float32x3');
+      assert.equal(p.positionTransform, undefined);
+    } else {
+      assert.equal(p.streams.position.format, 'unorm16x4');
+      assert.ok(p.positionTransform);
+      assert.equal(p.streams.normal.format, 'snorm8x4');
+      assert.equal(p.streams.uv.format, 'unorm16x2', 'grid UVs lie in [0,1]');
+    }
+    // Decoded positions lie on the source grid (within half a quantization step).
+    const pos = decodeStream(v, p.streams.position, p.vertexCount);
+    const pt = p.positionTransform ?? { scale: [1, 1, 1], offset: [0, 0, 0] };
+    const step = Math.max(...pt.scale) / 65535;
     for (let i = 0; i < p.vertexCount; i++) {
-      assert.ok(Math.abs(Math.hypot(tan[i * 4], tan[i * 4 + 1], tan[i * 4 + 2]) - 1) < 1e-3);
+      const x = pos[i * 4] * pt.scale[0] + pt.offset[0], y = pos[i * 4 + 1] * pt.scale[1] + pt.offset[1];
+      assert.ok(Math.abs(x * 16 - Math.round(x * 16)) <= 16 * step + 1e-5, `x ${x} on grid`);
+      assert.ok(Math.abs(y * 16 - Math.round(y * 16)) <= 16 * step + 1e-5, `y ${y} on grid`);
+    }
+    // MikkTSpace tangents: unit xyz (to quantization precision), w = +-1.
+    const tan = decodeStream(v, p.streams.tangent, p.vertexCount);
+    for (let i = 0; i < p.vertexCount; i++) {
+      assert.ok(Math.abs(Math.hypot(tan[i * 4], tan[i * 4 + 1], tan[i * 4 + 2]) - 1) < 0.02);
       assert.equal(Math.abs(tan[i * 4 + 3]), 1);
     }
     const q = m.meshes[1].primitives[0];
@@ -160,14 +243,25 @@ test('bake: generated glTF through the webgpu target reads back consistently', a
     assert.equal(q.streams.position.byteOffset !== p.streams.position.byteOffset || !q.streams.uv, true);
     // One image used as colour and as normal map -> two entries (different colour space / codec).
     assert.equal(m.textures.length, 2);
+    const KTX2_ID = [0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a];
     for (const t of m.textures) {
-      assert.equal(t.encoding, textureFormat === 'rgba8' ? 'rgba8' : 'ktx2');
-      assert.equal(t.mipLevelCount, 4);
-      if (t.encoding === 'rgba8') assert.equal(t.levels!.length, 4);
-      else {
-        const k = f.section('texture').subarray(t.data.byteOffset, t.data.byteOffset + 12);
-        assert.deepEqual([...k], [0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a]);
+      const head = [...f.section('texture').subarray(t.data.byteOffset, t.data.byteOffset + 12)];
+      if (textureFormat === 'universal') {
+        assert.equal(t.encoding, 'ktx2');
+        assert.deepEqual(head, KTX2_ID);
+        continue;
       }
+      assert.equal(t.encoding, textureFormat);
+      assert.notDeepEqual(head, KTX2_ID, 'native textures are raw GPU blocks, not KTX2');
+      assert.equal(t.levels!.length, t.mipLevelCount);
+      assert.equal(t.levels![0].width, t.width);
+      const fmt = t.format!;
+      if (textureFormat === 'rgba8') assert.match(fmt, /^rgba8unorm/);
+      if (textureFormat === 'bc7') assert.match(fmt, /^bc7-rgba-unorm/);
+      if (textureFormat === 'astc') assert.match(fmt, /^astc-4x4-unorm/);
+      if (textureFormat === 'etc2') assert.match(fmt, /^etc2-rgb8unorm/);
+      assert.equal(fmt.endsWith('-srgb'), t.colorSpace === 'srgb');
+      for (const l of t.levels!) assert.equal(l.byteLength, textureLevelBytes(fmt, l.width, l.height));
     }
     assert.equal(m.textures.find((t) => t.usage === 'color')!.colorSpace, 'srgb');
     assert.equal(m.textures.find((t) => t.usage === 'normal')!.colorSpace, 'linear');
