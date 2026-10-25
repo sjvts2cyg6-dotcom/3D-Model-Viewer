@@ -22,9 +22,12 @@ npm run build      # type-check + production bundle in dist/
 npm run preview    # serve dist/
 npm run screenshot # headless Chrome + SwiftShader render -> screenshot.png (after build)
 npm run check:shaders # compile + validate every shader feature variant (incl. disabled ones)
-npm test           # baker / .wgm round-trip tests (node:test via tsx)
+npm test           # baker, device-profile and orchestrator tests (node:test via tsx; needs Chrome for the e2e ones)
 npm run bake -- model.glb -o out/   # bake glTF -> out/model.wgm (see "Asset baking")
+npm run local -- model.glb -o out/  # probe THIS machine in its browser, then bake for it (see "Three apps")
 ```
+
+Probe page: `/probe.html` (dev server or `dist/`) measures the device and offers its DeviceProfile as a download.
 
 URL options: `?model=/path/to/file.glb` (or `.gltf`, or a baked `.wgm`, detected by its magic
 bytes), `?msaa=1` (disable 4x MSAA), `?dpr=1.5` (cap device pixel ratio, useful on phones to save
@@ -66,9 +69,18 @@ src/
   shaders/     pbr.wgsl      metallic-roughness PBR (GGX, Smith-GGX correlated, Schlick), ACES tonemap
                mipmap.wgsl   downsample blit
   controls/    orbit.ts      orbit camera on Pointer Events (mouse + touch + pinch), damped
+  probe/       profile.ts    DeviceProfile v1 schema + validation (pure; also used by the baker)
+               measure.ts    adapter/limits/compression/screen/benchmark -> DeviceProfile, device class
+               main.ts       probe.html app: show/download, optional loopback report (?report=&token=)
   main.ts      demo app: init, load model, frame it, run loop, HUD
+probe.html     the probe page (second Vite entry)
 tools/bake/    offline baker (Node, never bundled): cli.ts, bake.ts, prepare.ts, geometry.ts,
+               device.ts (profile -> options), headlessProbe.ts (--device auto),
                targets/ (profiles), textures/ (decode, mips, KTX2 encode), test/
+tools/local/   orchestrator (node:* only, no baker/probe imports): cli.ts, orchestrator.ts (state machine),
+               server.ts (127.0.0.1 report endpoint + static), processes.ts (open URL, spawn baker),
+               protocol.ts (own copy of the profile rules, NDJSON parsing), test/
+scripts/headless-browser.mjs  headless Chrome stand-in for --browser-cmd (tests / CI)
 ```
 
 ### Key design choices
@@ -140,12 +152,94 @@ TEXCOORD_0, TANGENT; uint8/16/32 indices (or none); interleaved, normalized and 
 accessors; node TRS or matrix; base color, metallic-roughness, normal, occlusion and emissive
 textures with samplers; alpha OPAQUE / MASK / BLEND; doubleSided; `KHR_materials_emissive_strength`.
 
+## Three apps: probe, baker, orchestrator
+
+| App | Command / URL | What it does |
+|---|---|---|
+| **Probe** | `/probe.html` | Runs on the target device's browser. Reads WebGPU adapter info, features, limits, texture-compression support, screen/DPR, memory, and a short fill-rate benchmark into a **DeviceProfile** JSON. Standalone it shows the profile and offers *Download device-profile.json*. |
+| **Baker** | `npm run bake -- in.glb --device profile.json` | Bakes glTF, tailored to a profile: caps texture size to the screen and GPU limits, sets a triangle budget for the device class, picks the LOD policy. `--json` for NDJSON events, with meaningful exit codes. |
+| **Orchestrator** | `npm run local -- in.glb` | Same-machine convenience. Opens the probe in your **real default browser**, receives the profile over a loopback HTTP report, then runs the baker as a separate process with that profile. Optionally opens the viewer on the result. |
+
+The three only talk through documented interfaces (URL params, HTTP report, CLI args, stdin,
+NDJSON, exit codes), so a different engine's probe or baker can be swapped in. See **[PROTOCOL.md](PROTOCOL.md)**.
+
+### Two workflows
+
+```
+A) Target is a different machine (e.g. a phone)            B) Target is this machine
+
+  phone browser                 dev machine                  npm run local -- model.glb --detail high
+ ┌──────────────┐           ┌─────────────────────────┐      ┌───────────────────────────────────────────────┐
+ │ /probe.html  │ download  │ npm run bake -- model.glb│      │ orchestrator (127.0.0.1:random, one-time token)│
+ │  (measure)   │──────────▶│   --device profile.json  │      │   1. opens default browser:                    │
+ └──────────────┘  profile  │   --detail medium -o out/│      │      /probe.html?report=…/report&token=…       │
+                   .json    └────────────┬────────────┘      │   2. probe POSTs DeviceProfile ──▶ validated   │
+                                         ▼                   │   3. spawns: bake model.glb --device - --json  │
+                                   out/model.wgm             │      (profile on stdin, NDJSON back)           │
+                                         │                   │   4. --open: /?model=/out/model.wgm            │
+                         host it, open /?model=…/model.wgm   └───────────────────────────────────────────────┘
+```
+
+### Probe
+
+Open `/probe.html` on the device (served over https or localhost, since WebGPU needs a secure
+context). `?bench=0` skips the benchmark. When the page gets `?report=<loopback url>&token=…` it
+also POSTs the profile there (only to `127.0.0.1` / `localhost` / `[::1]`).
+
+### Baker device options
+
+```bash
+npm run bake -- model.glb -o out/ --device profile.json --detail medium   # file
+cat profile.json | npm run bake -- model.glb --device - --json            # stdin + NDJSON events
+npm run bake -- model.glb --device auto                                   # headless probe of this host (needs npm run build)
+npm run bake -- --device profile.json --print-device --json               # just validate/print the profile
+```
+
+- `--detail low|medium|high|max` scales the texture cap (longest physical screen side × 0.5/1/2/∞,
+  power of two, ≤ GPU `maxTextureDimension2D`, ≤ 4096; mobile ≤ 2048 below high; software ≤ 1024;
+  ≤ 2 GB RAM ≤ 1024) and the triangle budget (desktop 2M, mobile 300k, software 100k at medium;
+  ×0.25 / ×4 / unlimited).
+- `--max-triangles N` sets the budget directly. When the drawn scene (counting instances) is over budget,
+  LOD0 of every primitive is simplified by budget/drawn and the LOD chain continues from there.
+- Any explicit knob (`--max-texture-size`, `--lods`, `--texture-format`, …) overrides the derived value. The
+  baker prints each decision and which flags overrode it.
+- Exit codes: 0 ok, 1 internal, 2 usage, 3 input, 4 device profile, 5 bake.
+
+### Orchestrator (`npm run local`)
+
+```bash
+npm run build                                   # the orchestrator serves dist/ (probe + viewer)
+npm run local -- model.glb -o out/ --detail high --open
+npm run local -- model.glb --allow-cached       # if probing fails, use this machine's last profile
+npm run local -- model.glb --fallback-headless  # if probing fails, use the headless (software) probe
+npm run local -- model.glb --use-cached         # skip probing
+```
+
+Strictly sequential: `idle → probing → profile-received → baking → done | error`. The baker is
+never started before a complete, schema-valid profile with the right one-time token has arrived.
+Malformed or wrong-token reports are rejected (400/403/409) and ignored. On timeout
+(`--probe-timeout`, default 120 s), a probe error, the probe tab being closed, or a browser that
+cannot be launched, it **does not bake**. It stops with a clear message and a non-zero exit code, unless
+`--allow-cached` or `--fallback-headless` was given. It always prints `PROFILE SOURCE: BROWSER | CACHE | HEADLESS`.
+Profiles from a real browser are cached per machine (`~/.config/webgpu-engine/device-profile.json`;
+`--no-cache`, `--cache-dir`). Unknown flags are passed to the baker. `--browser-cmd "<cmd> {url}"`
+(or `WGM_BROWSER`) replaces the default opener (`open` / `start` / `xdg-open`), and `--baker-cmd`
+(`WGM_BAKER`) swaps the baker. `--json` gives NDJSON events. Exit codes: 0 ok, 2 usage, 10 probe timeout,
+11 probe failed/closed, 12 no browser, 13 fallback unavailable, 20 baker failed.
+
+**Tested on this headless CI-like box:** everything except a real headful browser. The tests use
+`scripts/headless-browser.mjs` as a `--browser-cmd` stand-in (headless Chrome + SwiftShader that loads the
+URL the orchestrator gives it). **Not tested here:** launching the real default browser via
+`xdg-open`/`open`/`start`, a hardware GPU adapter, real screen/DPR values, ASTC/ETC2-capable devices, and
+the `pagehide` close beacon in an interactive browser.
+
 ## Asset baking (`tools/bake`)
 
 ```bash
 npm run bake -- <input.glb|.gltf> -o <outdir> [--target webgpu] [--lods N] [--texture-format auto|uastc|etc1s|rgba8]
 #   --lod-ratio 0.5  --lod-max-error 0.05  --max-texture-size 4096
 #   --etc1s-quality 192  --uastc-level 2  --[no-]uastc-rdo  --recompute-tangents  -q
+#   --device <file|-|auto>  --detail low|medium|high|max  --max-triangles N  --json  --print-device
 ```
 
 Writes `<outdir>/<name>.wgm` and prints sizes, vertex/triangle counts, per-LOD triangles and timings.
@@ -212,7 +306,16 @@ glTF-loaded meshes have a single level. The HUD shows how many draws used a redu
 `npm test` runs `tools/bake/test/*.test.ts`: `.wgm` write/read round trip, rejection of corrupt
 files (magic, truncation, version, LOD and stream ranges), LOD invariants, and a full bake of a
 generated glTF in `rgba8` and `auto` modes (uint16 indices, unit MikkTSpace tangents with w = ±1,
-no tangents without a normal map, KTX2 identifiers, colour spaces).
+no tangents without a normal map, KTX2 identifiers, colour spaces). `device.test.ts` covers profile
+validation, profile → options for desktop/phone/limited GPUs, the triangle budget, and the CLI's
+`--json` events, `--device -`, flag overrides and exit codes.
+
+`tools/local/test/local.test.ts` runs the real orchestrator CLI against the real baker CLI and the
+built probe page (headless stand-in browser). It checks: the import graph (only `node:*` and siblings);
+server token, one-time use, and rejection of malformed reports; the happy path in order (report, then
+baker spawn, then result, then viewer frames); timeout, then exit 10 with a spy baker never executed;
+bad or wrong-token reports rejected, then still no bake; page closed, then exit 11; no display, then exit 12;
+`--allow-cached`, then source cache; `--fallback-headless`, then a separate `--print-device` probe before the bake.
 
 Visual check against the glTF path (sample models are git-ignored, never committed):
 
@@ -241,6 +344,8 @@ and `*.wgm` are in `.gitignore`.
 - glTF-path tangent generation is Lengyel-style; use baked files for exact MikkTSpace tangents.
 - Basis transcoding runs on the main thread; Basis encoding in the baker is slow (tens of
   seconds per 2K texture). UASTC files are large on disk (their win is GPU memory/bandwidth).
+- The orchestrator's headful path (real default browser, hardware GPU) is untested on the GPU-less build box;
+  device classification is heuristic (no GPU tiering by benchmark yet).
 - LOD selection has no hysteresis; LODs simplify each primitive independently (no cross-mesh merging).
 
 ## Roadmap
@@ -258,7 +363,7 @@ chains with screen-space selection, shared baking pipeline with target profiles,
    GPU-driven culling with indirect draws. LOD hysteresis and per-node LOD.
 6. **Instancing:** batch identical (mesh, material) pairs (the baker already dedupes geometry)
    into one `drawIndexed(count, instances)` with per-instance transforms in a storage buffer.
-7. **More bake targets** for the other engines (mobile/desktop native).
+7. **More bake targets** for the other engines (mobile/desktop native), plus their own probes speaking [PROTOCOL.md](PROTOCOL.md).
 8. Then: opt-in shadow maps (`ShadowPass`), IBL (prefiltered env + BRDF LUT baked offline),
    render bundles for static geometry, timestamp-query profiling.
 
