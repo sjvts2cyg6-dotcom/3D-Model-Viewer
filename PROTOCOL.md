@@ -81,15 +81,23 @@ Rejected reports never advance the orchestrator; it keeps waiting until the time
 ## 3. Baker CLI
 
 ```
-wgm-bake <input.glb|.gltf> [-o dir] [--device <file|-|auto>] [--detail low|medium|high|max]
-         [--max-triangles N] [reduction knobs: --lods, --lod-ratio, --max-texture-size, --texture-format, …]
+wgm-bake <input.glb|.gltf> [-o dir] [--device <file|-|auto|preset>] [--detail low|medium|high|max]
+         [--max-triangles N] [reduction knobs: --lods, --lod-ratio, --max-texture-size, --texture-format,
+          --astc-block, --vertex-precision, --normal-encoding, --pixel-error, …]
          [--json] [--print-device]
 ```
 
 - `--device <file>` reads a profile file, `-` reads it from **stdin**, `auto` runs a headless
   Chrome probe of this machine (SwiftShader on GPU-less hosts; needs `npm run build`).
+  A bare preset name (`desktop-1080p`, `phone`, `phone-etc2`) or `preset:<name>` loads a built-in
+  profile from `tools/bake/presets/`; presets are **estimates**, not measurements (source `"preset"`).
 - `--detail` scales what the profile allows (texture cap from screen size × 0.5/1/2/∞; triangle
-  budget ×0.25/1/4/unlimited around desktop 2M, mobile 300k, software 100k).
+  budget ×0.25/1/4/unlimited around desktop 2M, mobile 300k, software 100k; vertex tolerance
+  1/0.5/0.25/0.1 px, 1°/0.5°/0.25°/0.05°; ASTC 6x6 instead of 4x4 at `low`).
+- The profile's `gpu.textureCompression` picks a **native** texture format (`options.textureFormat`
+  in the `device` event): `astc` (mobile, or no BC), `bc7`, `etc2`, `rgba8`, or `each` if WebGPU was
+  unavailable. Nothing in such files is transcoded or decompressed at load. `--texture-format universal`
+  (KTX2/Basis) is the only mode the engine transcodes at load; it is never chosen automatically.
 - Explicit knobs always override derived ones (listed in `overriddenByFlags`).
 - `--print-device` (needs `--device`, input optional) resolves and validates the profile, emits it, and exits without baking.
 
@@ -102,8 +110,9 @@ One JSON object per stdout line, each with `event` and `t` (ms since start). Hum
 | `start` | `tool: "wgm-bake"`, `protocol: 1`, `input`, `target`, `pid` |
 | `log` | `level: "info"\|"warn"`, `message` |
 | `profile` | (only `--print-device`) `source: "file"\|"stdin"\|"headless"`, `profile` |
-| `device` | `source`, `summary` (class, gpu, screen, compression, detail, probedAt, headless), `decisions[]`, `options`, `overriddenByFlags[]` |
-| `result` | `output` (absolute path), `inputBytes`, `outputBytes`, `ms`, `target`, `options`, `stats`, `device` (summary or null) |
+| `device` | `source` (`file`\|`stdin`\|`headless`\|`preset`), `summary` (class, gpu, screen, compression, detail, probedAt, headless), `decisions[]`, `options` (incl. `textureFormat`, `astcBlock`, `vertexTolerance`), `overriddenByFlags[]` |
+| `output` | (only `--texture-format each`) one per written file, same fields as `result` |
+| `result` | `output` (absolute path), `inputBytes`, `outputBytes`, `ms`, `target`, `options`, `stats` (incl. `vertexBytesF32`, `vertexBytes`, `vertexFormats`, `maxPositionPixelError`, `maxNormalErrorDeg`, `maxUvErrorTexels`, `textureFormats`, `textureBytes`), `device` (summary or null). With `--texture-format each`: `output` is the template `<dir>/<name>.{tex}.wgm` (the viewer resolves `{tex}`), `outputs[]` lists the files, and `stats`/`outputBytes` are omitted (see the `output` events). |
 | `error` | `code`, `exitCode`, `message` |
 
 ### Exit codes

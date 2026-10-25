@@ -6,11 +6,15 @@ target, and a shared offline asset pipeline (`tools/bake`) bakes glTF into the f
 runtime wants (for this engine: the `.wgm` container, see [FORMAT.md](FORMAT.md)).
 
 Runtime dependency: [`wgpu-matrix`](https://github.com/greggman/wgpu-matrix) (math only).
-Runtime asset (lazy-loaded, only when a KTX2 texture is met): the Basis Universal transcoder
+Baked files need **no decompression or transcoding at load**: vertices are stored in quantized
+GPU vertex formats and textures in the GPU's own block format (BC7 / ASTC / ETC2) with
+precomputed mips; the loader hands bytes to `writeBuffer` / `writeTexture`.
+Runtime asset (lazy-loaded, only for files baked with the opt-in `--texture-format universal`): the Basis Universal transcoder
 (`public/basis/`, Apache-2.0, from [BinomialLLC/basis_universal](https://github.com/BinomialLLC/basis_universal)).
 Dev tooling: Vite, TypeScript, `@webgpu/types`, `puppeteer-core` (headless screenshots), and for the
 offline baker only: `@gltf-transform/*`, `meshoptimizer`, `mikktspace`, `ktx2-encoder` (Basis encoder
-wasm), `pngjs`, `jpeg-js`, `tsx`. None of the baker dependencies end up in the browser bundle.
+wasm), `astc-encoder.js` (ARM astcenc wasm, Apache-2.0), `pngjs`, `jpeg-js`, `tsx`. The baker also runs the
+vendored Basis transcoder in Node to turn its UASTC intermediate into BC7 / ETC2 offline. None of the baker dependencies end up in the browser bundle.
 
 
 ## Running
@@ -32,7 +36,10 @@ Probe page: `/probe.html` (dev server or `dist/`) measures the device and offers
 URL options: `?model=/path/to/file.glb` (or `.gltf`, or a baked `.wgm`, detected by its magic
 bytes), `?msaa=1` (disable 4x MSAA), `?dpr=1.5` (cap device pixel ratio, useful on phones to save
 fill-rate), `?lod=N` (force LOD level N), `?lodpx=E` (LOD pixel-error threshold, default 1),
-`?tex=bc7|astc|etc2|rgba8` (force the KTX2 transcode target).
+`?tex=bc7|astc|etc2|rgba8` (force the transcode target of opt-in `universal` KTX2 files),
+`?nocompression=1` (create the device without texture-compression features, to see the
+"re-bake for this device" error). A `{tex}` in the model URL (`?model=/out/name.{tex}.wgm`, from
+`--texture-format each`) is replaced by the best native format the device supports.
 
 Controls: drag to orbit, right/middle/shift-drag to pan, wheel to zoom.
 Touch: one finger orbits, two fingers pinch-zoom and pan.
@@ -65,7 +72,7 @@ src/
                modelLoader.ts fetch once, sniff glTF/GLB vs .wgm, CPU data -> GPU resources + scene subtree
                wgm/format.ts  .wgm reader/writer + types (shared with the baker; no DOM/Node APIs)
                wgm/loader.ts  .wgm -> one vertex buffer, one index buffer, textures, materials, nodes
-               ktx2/transcoder.ts  lazy Basis transcoder, picks BC7 / ASTC / ETC2 / RGBA8 per device
+               ktx2/transcoder.ts  Basis transcoder, dynamically imported ONLY for opt-in universal (KTX2) files
   shaders/     pbr.wgsl      metallic-roughness PBR (GGX, Smith-GGX correlated, Schlick), ACES tonemap
                mipmap.wgsl   downsample blit
   controls/    orbit.ts      orbit camera on Pointer Events (mouse + touch + pinch), damped
@@ -76,7 +83,8 @@ src/
 probe.html     the probe page (second Vite entry)
 tools/bake/    offline baker (Node, never bundled): cli.ts, bake.ts, prepare.ts, geometry.ts,
                device.ts (profile -> options), headlessProbe.ts (--device auto),
-               targets/ (profiles), textures/ (decode, mips, KTX2 encode), test/
+               quantize.ts (GPU-native vertex formats + error measurement), presets/ (estimated profiles),
+               targets/ (profiles), textures/ (decode, mips, native BC7/ASTC/ETC2 encode, KTX2), test/
 tools/local/   orchestrator (node:* only, no baker/probe imports): cli.ts, orchestrator.ts (state machine),
                server.ts (127.0.0.1 report endpoint + static), processes.ts (open URL, spawn baker),
                protocol.ts (own copy of the profile rules, NDJSON parsing), test/
@@ -100,7 +108,11 @@ scripts/headless-browser.mjs  headless Chrome stand-in for --browser-cmd (tests 
   and emissive textures are uploaded as `rgba8unorm-srgb`, data textures as linear.
 - **Mipmaps generated on the GPU** at load time for glTF; baked files ship them precomputed.
 - **Non-interleaved vertex streams** (position / normal / uv / tangent) keep the loader simple
-  and allow a depth-only pass to bind positions alone later.
+  and allow a depth-only pass to bind positions alone later. Baked streams are **quantized
+  GPU vertex formats** (unorm16 positions dequantized by a per-draw scale/offset, snorm8/16 or
+  octahedral normals/tangents, unorm16/float16 UVs); the shader declares `vec4f` inputs so one
+  module serves every format, and pipelines are cached per vertex layout
+  (`renderer/vertexLayout.ts`; octahedral layouts add an `OCT_NORMAL`/`OCT_TANGENT` define).
 - **Tangents generated only when a normal map needs them**; missing normals are computed.
   (glTF path: Lengyel-style at load time; baked path: MikkTSpace in the baker.)
 
@@ -201,7 +213,19 @@ npm run bake -- --device profile.json --print-device --json               # just
   ×0.25 / ×4 / unlimited).
 - `--max-triangles N` sets the budget directly. When the drawn scene (counting instances) is over budget,
   LOD0 of every primitive is simplified by budget/drawn and the LOD chain continues from there.
-- Any explicit knob (`--max-texture-size`, `--lods`, `--texture-format`, …) overrides the derived value. The
+- **Texture format** from the profile's `textureCompression` (always native, never transcoded at load):
+  ASTC on mobile (or any device without BC; block 6x6 at `--detail low`, else 4x4), BC7 on desktop/software
+  with BC, ETC2 if that is all there is, RGBA8 if there is no compression, and `each` (one file per format)
+  if the probe saw no WebGPU at all.
+- **Vertex precision tolerance** from the screen and detail: position error ≤ 1 / 0.5 / 0.25 / 0.1 px
+  (low/medium/high/max) when the mesh's bounding diagonal spans the longest physical screen side;
+  normal/tangent error ≤ 1° / 0.5° / 0.25° / 0.05°; UV error ≤ 0.5 / 0.25 / 0.125 / 0.0625 texel of the
+  largest texture the material samples. snorm8 normals (max ≈0.4°) pass at low/medium, snorm16 at high/max.
+- **Presets** (`--device <name>` or `preset:<name>`, files in `tools/bake/presets/`): `desktop-1080p`
+  (BC only, 1920x1080@1, 8 GB), `phone` (ASTC+ETC2, 390x844@3, 4 GB), `phone-etc2` (ETC2 only,
+  360x780@2). These are **hand-written estimates of typical devices, not measurements**; their
+  `probe.name` says so. A real probe of the target device is always better.
+- Any explicit knob (`--max-texture-size`, `--lods`, `--texture-format`, `--vertex-precision`, …) overrides the derived value. The
   baker prints each decision and which flags overrode it.
 - Exit codes: 0 ok, 1 internal, 2 usage, 3 input, 4 device profile, 5 bake.
 
@@ -230,16 +254,19 @@ Profiles from a real browser are cached per machine (`~/.config/webgpu-engine/de
 **Tested on this headless CI-like box:** everything except a real headful browser. The tests use
 `scripts/headless-browser.mjs` as a `--browser-cmd` stand-in (headless Chrome + SwiftShader that loads the
 URL the orchestrator gives it). **Not tested here:** launching the real default browser via
-`xdg-open`/`open`/`start`, a hardware GPU adapter, real screen/DPR values, ASTC/ETC2-capable devices, and
-the `pagehide` close beacon in an interactive browser.
+`xdg-open`/`open`/`start`, a hardware GPU adapter, real screen/DPR values, a real phone, and
+the `pagehide` close beacon in an interactive browser. (SwiftShader does expose BC, ASTC and ETC2, so all
+three native texture formats are rendered here; the phone/desktop presets are estimates.)
 
 ## Asset baking (`tools/bake`)
 
 ```bash
-npm run bake -- <input.glb|.gltf> -o <outdir> [--target webgpu] [--lods N] [--texture-format auto|uastc|etc1s|rgba8]
-#   --lod-ratio 0.5  --lod-max-error 0.05  --max-texture-size 4096
-#   --etc1s-quality 192  --uastc-level 2  --[no-]uastc-rdo  --recompute-tangents  -q
-#   --device <file|-|auto>  --detail low|medium|high|max  --max-triangles N  --json  --print-device
+npm run bake -- <input.glb|.gltf> -o <outdir> [--target webgpu] [--lods N]
+#   --texture-format auto|bc7|astc|etc2|rgba8|each|universal   --astc-block 4x4|5x5|6x6|8x8  --astc-quality fast|medium|thorough
+#   --vertex-precision auto|full|low  --normal-encoding auto|oct  --pixel-error PX
+#   --lod-ratio 0.5  --lod-max-error 0.05  --max-texture-size 4096  --uastc-level 2  --recompute-tangents  -q
+#   --device <file|-|auto|desktop-1080p|phone|phone-etc2>  --detail low|medium|high|max  --max-triangles N  --json  --print-device
+#   universal only: --etc1s-quality 192  --[no-]uastc-rdo  --zstd
 ```
 
 Writes `<outdir>/<name>.wgm` and prints sizes, vertex/triangle counts, per-LOD triangles and timings.
@@ -270,28 +297,49 @@ textures, without touching the others. Only `webgpu` exists today.
   (normals + UVs weighted), each level ~`--lod-ratio` of the previous, stopping when
   simplification stalls or exceeds `--lod-max-error`; levels share LOD0's vertices and are
   cache-optimized themselves. Each level stores its error in mesh units.
-- **Vertex layout:** exactly the engine's pipeline layout (`f32-split-v1`: split float32 streams
-  position/normal/uv/tangent). No quantization yet: the shaders and pipeline cache assume
-  float32 streams, so a quantized layout is a roadmap item, not a hack.
+- **Vertex quantization (`split-v2`, GPU-native, no decode at load):** per primitive the baker
+  encodes each stream, decodes it exactly as the GPU's vertex fetch will, measures the worst
+  error and keeps the smallest format under the tolerance (`--vertex-precision auto`, default):
+  - positions `unorm16x4` on one grid per mesh (no cracks between its primitives), dequantized in
+    the vertex shader from the per-draw uniform (`posScale`/`posOffset`); falls back to `float32x3`
+    if the grid error would exceed the pixel tolerance (`--pixel-error` overrides it);
+  - normals and tangents `snorm8x4` → `snorm16x4` → `float32`, or with `--normal-encoding oct`
+    octahedral `snorm16x2` (decoded in the shader; tangent sign folded into y);
+  - UVs `unorm16x2` when all lie in [0,1], else `float16x2` if within the UV-texel tolerance, else `float32x2`.
+  `--vertex-precision full` keeps float32 everywhere; `low` takes the smallest formats regardless
+  (warning when over tolerance). Measured on the Khronos samples: −50% vertex bytes
+  (DamagedHelmet 48 → 24 B/vertex: its UVs span [0,2), where float16 would be off by 1 texel at
+  2048², so UVs stay float32; BoxTextured 32 → 16; MetalRoughSpheres 24 → 12). Zero-length source
+  normals/tangents (MikkTSpace emits them for collapsed UVs) are ignored by the error measure. Stats in the
+  file and in the `result` event: `vertexBytesF32`, `vertexBytes`, `vertexFormats`,
+  `maxPositionPixelError`, `maxNormalErrorDeg`, `maxUvErrorTexels`.
 - **Dedup:** identical geometry (content hash) shared by several meshes is stored once;
   identical (image, usage) textures are encoded once.
-- **Textures:** decoded (PNG/JPEG), padded/resized to multiples of 4 (max `--max-texture-size`),
-  full mip chain computed offline (sRGB-correct for colour, renormalized for normal maps), then
-  - `auto` (default): **KTX2/Basis** with **ETC1S** for colour (base colour, emissive) and
-    **UASTC + Zstd** for normal and ORM/data maps (RDO on data maps; off for normals);
-  - `uastc` / `etc1s`: force one codec for all textures;
-  - `rgba8`: raw RGBA8 mip chain (largest, zero runtime work).
+- **Textures:** decoded (PNG/JPEG), resized so level 0 is a whole number of blocks (never above
+  `--max-texture-size`), full mip chain computed offline (sRGB-correct for colour, renormalized
+  for normal maps), then stored **in the GPU's native block format** (`--texture-format`):
+  - `auto` (default): from `--device` (see above); **without a profile: BC7** (with a warning);
+  - `bc7`: Basis UASTC encode (no RDO, no Zstd) → BC7 transcode **in the baker** (UASTC→BC7 is
+    near-lossless); `etc2`: the same intermediate → ETC2 RGB8 (opaque) / ETC2 RGBA8 (alpha);
+  - `astc`: ARM astcenc (wasm) per mip level, `--astc-block 4x4|5x5|6x6|8x8` (8 / 5.12 / 3.56 / 2 bits per texel);
+  - `rgba8`: raw RGBA8 mip chain (largest, works everywhere);
+  - `each`: one file per native format (`name.bc7.wgm`, `name.astc.wgm`, `name.etc2.wgm`,
+    `name.rgba8.wgm`) when the target's formats are unknown; load `?model=…/name.{tex}.wgm`;
+  - `universal` (opt-in, **the only mode that transcodes at load**): KTX2/Basis, ETC1S colour +
+    UASTC data (`uastc` / `etc1s` force one codec); Zstd supercompression only with `--zstd`.
 
-### Textures at runtime (status: implemented)
+### Textures at runtime
 
-KTX2 is real, not a stub: the baker encodes with the Basis Universal encoder (wasm, via
-`ktx2-encoder`), and the engine transcodes at load time with the official Basis transcoder
-(lazy-loaded from `public/basis/`, ~1 MB wasm, fetched only when a file contains KTX2 textures).
-The device is created with whichever of `texture-compression-bc`, `-astc`, `-etc2` the adapter
-offers, and the transcode target is picked in this order: **BC7 -> ASTC 4x4 -> ETC2 (ETC1
-for opaque ETC1S) -> uncompressed RGBA8**. Precomputed mips are uploaded level by level, with
-sRGB formats for colour textures. Override with `?tex=...`. Transcoding currently runs on the
-main thread.
+Native files: the loader first checks that the device has the feature for every texture format in
+the file (`texture-compression-bc` / `-astc` / `-etc2`). If one is missing it throws before uploading
+anything, naming the missing feature and the re-bake (`--device <profile>` / `--texture-format …` /
+`each`). Otherwise each mip level goes to `writeTexture` as stored; there is no CPU decode. The load
+stats (`window.__engine.loadStats`) break this down: `parseMs`, `geometryUploadMs`,
+`textureUploadMs`, `transcoderLoadMs`, `transcodeMs` and `vertexDecodeMs` (the last three are 0 for native files).
+
+Universal (KTX2) files: the transcoder module is a separate chunk that is only imported when such a
+file is loaded. It fetches the Basis wasm (~1 MB) from `public/basis/` and transcodes on the main thread
+to BC7 → ASTC 4x4 → ETC2 → RGBA8, whichever the device has (override with `?tex=`).
 
 ### LOD API
 
@@ -303,12 +351,19 @@ glTF-loaded meshes have a single level. The HUD shows how many draws used a redu
 
 ### Testing the baker
 
-`npm test` runs `tools/bake/test/*.test.ts`: `.wgm` write/read round trip, rejection of corrupt
-files (magic, truncation, version, LOD and stream ranges), LOD invariants, and a full bake of a
-generated glTF in `rgba8` and `auto` modes (uint16 indices, unit MikkTSpace tangents with w = ±1,
-no tangents without a normal map, KTX2 identifiers, colour spaces). `device.test.ts` covers profile
-validation, profile → options for desktop/phone/limited GPUs, the triangle budget, and the CLI's
-`--json` events, `--device -`, flag overrides and exit codes.
+`npm test` runs `tools/bake/test/*.test.ts`: `.wgm` write/read round trip, v1-file readability,
+quantized-stream validation, rejection of corrupt files (magic, truncation, version, LOD and stream
+ranges), LOD invariants, and a full bake of a generated glTF in `rgba8`/full-precision, `bc7`, `astc`,
+`etc2`/low-precision and `universal` modes (uint16 indices, positions decoded from unorm16 land on the
+source grid, unit tangents with w = ±1, no tangents without a normal map, exact block sizes per mip,
+no KTX2 bytes in native files, colour spaces). `quantize.test.ts` covers half floats, position grid
+error bounds, snorm8/16 and octahedral normal/tangent error bounds incl. the tangent sign, precision
+selection vs tolerance and `--vertex-precision`, the native encoders (BC7, ASTC 4x4 and 6x6, ETC2
+RGB/RGBA, RGBA8) and `--texture-format each` / presets through the CLI. `device.test.ts` covers profile
+validation, profile → options (texture format per device, ASTC block, tolerances) for desktop/phone/
+limited GPUs, the presets, the triangle budget, and the CLI's `--json` events, `--device -`, flag
+overrides and exit codes. `npm run check:shaders` compiles and builds every shader feature × vertex
+layout variant (float32, quantized snorm8/16, octahedral, absent streams) on SwiftShader.
 
 `tools/local/test/local.test.ts` runs the real orchestrator CLI against the real baker CLI and the
 built probe page (headless stand-in browser). It checks: the import graph (only `node:*` and siblings);
@@ -322,7 +377,7 @@ Visual check against the glTF path (sample models are git-ignored, never committ
 ```bash
 mkdir -p test-assets && cd test-assets   # e.g. Khronos glTF-Sample-Assets BoxTextured, DamagedHelmet,
 cd ..                                    #      MetalRoughSpheresNoTextures (.glb)
-npm run bake -- test-assets/DamagedHelmet.glb -o test-assets/baked
+npm run bake -- test-assets/DamagedHelmet.glb -o test-assets/baked --device desktop-1080p
 npm run build
 ASSETS_DIR=test-assets HIDE_HUD=1 OUT=/tmp/a.png URL_QUERY="?model=/local/DamagedHelmet.glb" node scripts/screenshot.mjs
 ASSETS_DIR=test-assets HIDE_HUD=1 OUT=/tmp/b.png URL_QUERY="?model=/local/baked/DamagedHelmet.wgm&lod=0" node scripts/screenshot.mjs
@@ -342,29 +397,32 @@ and `*.wgm` are in `.gitignore`.
 - No frustum culling or instancing yet; draw list is rebuilt every frame.
 - Ambient is a hemisphere term + analytic env-BRDF, not image-based lighting; no shadows yet (architecture ready, see above).
 - glTF-path tangent generation is Lengyel-style; use baked files for exact MikkTSpace tangents.
-- Basis transcoding runs on the main thread; Basis encoding in the baker is slow (tens of
-  seconds per 2K texture). UASTC files are large on disk (their win is GPU memory/bandwidth).
+- Native textures are not supercompressed, so files are larger on disk than KTX2+Zstd would be
+  (that is the price of zero work at load; HTTP `Content-Encoding` can still compress the transfer).
+  BC7/ETC2 encoding in the baker (via UASTC) takes seconds per 2K texture.
+- One texture format per file: a device without it needs another bake (`each` covers unknown targets).
+- `universal` mode transcodes on the main thread.
 - The orchestrator's headful path (real default browser, hardware GPU) is untested on the GPU-less build box;
   device classification is heuristic (no GPU tiering by benchmark yet).
 - LOD selection has no hysteresis; LODs simplify each primitive independently (no cross-mesh merging).
 
 ## Roadmap
 
-Done: KTX2/Basis textures with BC7/ASTC/ETC2/RGBA8 transcoding, precomputed mips, meshopt LOD
-chains with screen-space selection, shared baking pipeline with target profiles, `.wgm` container.
+Done: native BC7/ASTC/ETC2/RGBA8 textures with precomputed mips (no runtime transcoding;
+KTX2 only as opt-in `universal`), GPU-native quantized vertex streams chosen against the device's
+visible tolerance, meshopt LOD chains with screen-space selection, shared baking pipeline with
+target profiles and device presets, `.wgm` v2 container (v1 still readable).
 
-1. **Transcode in a Worker** (and stream textures progressively: low mips first).
-2. **Quantized vertex layouts:** e.g. snorm16 positions with a dequant matrix, oct-encoded
-   normals/tangents, unorm16 UVs, as a new `vertexLayout` id that becomes part of the pipeline
-   cache key; interleave where it helps.
-3. **Cheaper ETC1S transcodes:** BC1 for opaque colour maps on desktop (ETC1 is already used on ETC2 devices); per-texture codec heuristics.
-4. **Meshopt buffer compression** (`EXT_meshopt_compression`-style) for smaller downloads, decoded in a worker.
-5. **Frustum culling:** world AABB per node tested against camera planes; later a BVH and
+1. **Progressive textures:** stream low mips first (still native blocks, no transcoding).
+2. **Per-texture format choice:** BC1 / ETC2 RGB for opaque colour on capable devices, BC5/EAC RG for
+   normal maps (needs a two-channel normal path in the shader).
+3. **Interleaved quantized vertices** where it helps fetch (e.g. 16-byte vertices on tilers).
+4. **Frustum culling:** world AABB per node tested against camera planes; later a BVH and
    GPU-driven culling with indirect draws. LOD hysteresis and per-node LOD.
-6. **Instancing:** batch identical (mesh, material) pairs (the baker already dedupes geometry)
+5. **Instancing:** batch identical (mesh, material) pairs (the baker already dedupes geometry)
    into one `drawIndexed(count, instances)` with per-instance transforms in a storage buffer.
-7. **More bake targets** for the other engines (mobile/desktop native), plus their own probes speaking [PROTOCOL.md](PROTOCOL.md).
-8. Then: opt-in shadow maps (`ShadowPass`), IBL (prefiltered env + BRDF LUT baked offline),
+6. **More bake targets** for the other engines (mobile/desktop native), plus their own probes speaking [PROTOCOL.md](PROTOCOL.md).
+7. Then: opt-in shadow maps (`ShadowPass`), IBL (prefiltered env + BRDF LUT baked offline),
    render bundles for static geometry, timestamp-query profiling.
 
 ## Headless screenshot notes
