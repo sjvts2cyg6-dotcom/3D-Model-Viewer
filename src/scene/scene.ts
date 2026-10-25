@@ -6,6 +6,12 @@ export interface DirectionalLight {
   direction: Vec3;
   color: Vec3;
   intensity: number;
+  /**
+   * Whether this light casts shadows. Only honoured when the renderer was
+   * created with `{ shadows: ... }` (opt-in, see renderer/config.ts); the
+   * light-space matrix comes from `computeDirectionalLightViewProj` (lighting.ts).
+   */
+  castShadows: boolean;
 }
 
 export interface Environment {
@@ -22,6 +28,7 @@ export class Scene {
     direction: vec3.normalize(vec3.create(-0.4, -1.0, -0.6)),
     color: vec3.create(1.0, 0.97, 0.92),
     intensity: 3.0,
+    castShadows: false,
   };
 
   ambient: Environment = {

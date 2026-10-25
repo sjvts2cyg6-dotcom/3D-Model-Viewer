@@ -33,7 +33,8 @@ async function main(): Promise<void> {
   const gpu = await initGpu(canvas, { onDeviceLost: (i) => showError(new Error(`GPU device lost: ${i.message || i.reason}`)) });
   observeCanvasSize(canvas, { maxTextureDimension: gpu.device.limits.maxTextureDimension2D, maxPixelRatio: maxDpr });
 
-  const renderer = new Renderer(gpu, { sampleCount: msaa });
+  // Opt-in features are config flags, e.g. { shadows: true } once ShadowPass lands.
+  const renderer = new Renderer(gpu, { msaa, shadows: false });
   const scene = new Scene();
   const camera = new PerspectiveCamera();
   const controls = new OrbitControls(canvas, camera);

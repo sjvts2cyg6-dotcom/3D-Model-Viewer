@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "screenshot": "node scripts/screenshot.mjs"
+    "screenshot": "node scripts/screenshot.mjs",
+    "check:shaders": "node scripts/check-shader-variants.mjs"
   },
   "dependencies": {
     "wgpu-matrix": "^3.4.2"

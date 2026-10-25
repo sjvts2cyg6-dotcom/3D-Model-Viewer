@@ -1,26 +1,49 @@
 import { pbrWgsl } from '../shaders';
+import { featureDefines, featureKey, type ShaderFeatures } from './features';
 import type { AlphaMode } from './material';
+import { preprocessWgsl } from './shaderPreprocessor';
 
 export const DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 /** model mat4 + normal mat4 */
 export const DRAW_UNIFORM_SIZE = 128;
-export const FRAME_UNIFORM_SIZE = 64 + 16 * 6;
 
-export interface BindGroupLayouts {
-  frame: GPUBindGroupLayout;
+/** Group 0 (per-frame / lighting) binding slots. Slots 1-2 are reserved for shadows. */
+export const FRAME_BINDING = {
+  uniforms: 0,
+  shadowMap: 1,
+  shadowSampler: 2,
+} as const;
+
+/** Float offsets into the Frame uniform struct (must match pbr.wgsl `struct Frame`). */
+export const FRAME_LAYOUT = {
+  viewProj: 0,
+  cameraPos: 16,
+  lightDir: 20,
+  lightColor: 24,
+  skyColor: 28,
+  groundColor: 32,
+  params: 36,
+  /** SHADOWS only */
+  lightViewProj: 40,
+  /** SHADOWS only */
+  shadowParams: 56,
+} as const;
+
+/** Byte size of the Frame uniform block for a feature set (no shadow fields unless enabled). */
+export function frameUniformSize(f: ShaderFeatures): number {
+  return (f.shadows ? FRAME_LAYOUT.shadowParams + 4 : FRAME_LAYOUT.params + 4) * 4;
+}
+
+/** Layouts shared by every feature variant: materials and draws never change shape. */
+export interface SharedLayouts {
   material: GPUBindGroupLayout;
   draw: GPUBindGroupLayout;
 }
 
-export function createBindGroupLayouts(device: GPUDevice): BindGroupLayouts {
-  const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+export function createSharedLayouts(device: GPUDevice): SharedLayouts {
   const F = GPUShaderStage.FRAGMENT;
   const tex = (binding: number): GPUBindGroupLayoutEntry => ({ binding, visibility: F, texture: { sampleType: 'float' } });
   return {
-    frame: device.createBindGroupLayout({
-      label: 'frame',
-      entries: [{ binding: 0, visibility: VF, buffer: { type: 'uniform' } }],
-    }),
     material: device.createBindGroupLayout({
       label: 'material',
       entries: [
@@ -40,47 +63,100 @@ export function createBindGroupLayouts(device: GPUDevice): BindGroupLayouts {
   };
 }
 
-const VERTEX_LAYOUTS: GPUVertexBufferLayout[] = [
+/** Group 0 layout for a feature set. */
+export function createFrameLayout(device: GPUDevice, f: ShaderFeatures): GPUBindGroupLayout {
+  const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+  const entries: GPUBindGroupLayoutEntry[] = [
+    { binding: FRAME_BINDING.uniforms, visibility: VF, buffer: { type: 'uniform', minBindingSize: frameUniformSize(f) } },
+  ];
+  if (f.shadows) {
+    entries.push(
+      { binding: FRAME_BINDING.shadowMap, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'depth' } },
+      { binding: FRAME_BINDING.shadowSampler, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'comparison' } },
+    );
+  }
+  return device.createBindGroupLayout({ label: `frame [${featureKey(f) || 'base'}]`, entries });
+}
+
+/**
+ * Vertex streams, one buffer per attribute. A depth-only pass (e.g. shadows)
+ * can bind just slot 0 with `POSITION_ONLY_LAYOUT`.
+ */
+export const VERTEX_LAYOUTS: GPUVertexBufferLayout[] = [
   { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }] },
   { arrayStride: 12, attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] },
   { arrayStride: 8, attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x2' }] },
   { arrayStride: 16, attributes: [{ shaderLocation: 3, offset: 0, format: 'float32x4' }] },
 ];
+export const POSITION_ONLY_LAYOUT: GPUVertexBufferLayout[] = [VERTEX_LAYOUTS[0]];
 
 export function pipelineKey(alphaMode: AlphaMode, doubleSided: boolean): string {
   return `${alphaMode}|${doubleSided ? 'ds' : 'ss'}`;
 }
 
-/** Lazily creates and caches PBR pipeline variants (alpha mode x culling). */
+/**
+ * Lazily creates and caches PBR pipelines keyed by
+ * (shader feature set, alpha mode, culling). Shader modules and frame
+ * layouts are cached per feature set.
+ */
 export class PipelineCache {
-  private readonly module: GPUShaderModule;
-  private readonly layout: GPUPipelineLayout;
-  private readonly cache = new Map<string, GPURenderPipeline>();
+  private readonly modules = new Map<string, GPUShaderModule>();
+  private readonly frameLayouts = new Map<string, GPUBindGroupLayout>();
+  private readonly pipelineLayouts = new Map<string, GPUPipelineLayout>();
+  private readonly pipelines = new Map<string, GPURenderPipeline>();
 
   constructor(
     private readonly device: GPUDevice,
-    layouts: BindGroupLayouts,
+    private readonly shared: SharedLayouts,
     private readonly colorFormat: GPUTextureFormat,
     private readonly sampleCount: number,
-  ) {
-    this.module = device.createShaderModule({ label: 'pbr', code: pbrWgsl });
-    this.layout = device.createPipelineLayout({
-      label: 'pbr',
-      bindGroupLayouts: [layouts.frame, layouts.material, layouts.draw],
-    });
+  ) {}
+
+  frameLayout(f: ShaderFeatures): GPUBindGroupLayout {
+    const fk = featureKey(f);
+    let l = this.frameLayouts.get(fk);
+    if (!l) {
+      l = createFrameLayout(this.device, f);
+      this.frameLayouts.set(fk, l);
+    }
+    return l;
   }
 
-  get(alphaMode: AlphaMode, doubleSided: boolean): GPURenderPipeline {
-    const key = pipelineKey(alphaMode, doubleSided);
-    let p = this.cache.get(key);
+  shaderModule(f: ShaderFeatures): GPUShaderModule {
+    const fk = featureKey(f);
+    let m = this.modules.get(fk);
+    if (!m) {
+      m = this.device.createShaderModule({ label: `pbr [${fk || 'base'}]`, code: preprocessWgsl(pbrWgsl, featureDefines(f)) });
+      this.modules.set(fk, m);
+    }
+    return m;
+  }
+
+  private pipelineLayout(f: ShaderFeatures): GPUPipelineLayout {
+    const fk = featureKey(f);
+    let l = this.pipelineLayouts.get(fk);
+    if (!l) {
+      l = this.device.createPipelineLayout({
+        label: `pbr [${fk || 'base'}]`,
+        bindGroupLayouts: [this.frameLayout(f), this.shared.material, this.shared.draw],
+      });
+      this.pipelineLayouts.set(fk, l);
+    }
+    return l;
+  }
+
+  get(f: ShaderFeatures, alphaMode: AlphaMode, doubleSided: boolean): GPURenderPipeline {
+    const key = `${featureKey(f)}/${pipelineKey(alphaMode, doubleSided)}`;
+    let p = this.pipelines.get(key);
     if (p) return p;
+    const module = this.shaderModule(f);
     const blend = alphaMode === 'BLEND';
     p = this.device.createRenderPipeline({
       label: `pbr ${key}`,
-      layout: this.layout,
-      vertex: { module: this.module, entryPoint: 'vs_main', buffers: VERTEX_LAYOUTS },
+      layout: this.pipelineLayout(f),
+      vertex: { module, entryPoint: 'vs_main', buffers: VERTEX_LAYOUTS },
       fragment: {
-        module: this.module,
+        module,
         entryPoint: 'fs_main',
         targets: [{
           format: this.colorFormat,
@@ -96,7 +172,7 @@ export class PipelineCache {
       depthStencil: { format: DEPTH_FORMAT, depthWriteEnabled: !blend, depthCompare: 'less' },
       multisample: { count: this.sampleCount, alphaToCoverageEnabled: false },
     });
-    this.cache.set(key, p);
+    this.pipelines.set(key, p);
     return p;
   }
 }

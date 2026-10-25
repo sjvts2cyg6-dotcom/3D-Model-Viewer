@@ -1,62 +1,52 @@
 import type { GpuContext } from '../core/gpu';
 import type { PerspectiveCamera } from '../scene/camera';
-import type { Node } from '../scene/node';
 import type { Scene } from '../scene/scene';
+import { resolveRendererConfig, type RendererConfig, type ResolvedRendererConfig } from './config';
+import { featuresFromConfig, type ShaderFeatures } from './features';
 import { createGpuPrimitive, createBuffer, type GpuPrimitive, type PrimitiveData } from './mesh';
 import { MATERIAL_UNIFORM_SIZE, materialSortKey, packMaterialUniforms, type GpuMaterial, type MaterialDesc } from './material';
 import {
-  createBindGroupLayouts, DEPTH_FORMAT, DRAW_UNIFORM_SIZE, FRAME_UNIFORM_SIZE, PipelineCache, pipelineKey,
-  type BindGroupLayouts,
+  createSharedLayouts, DRAW_UNIFORM_SIZE, FRAME_BINDING, FRAME_LAYOUT, frameUniformSize, PipelineCache, pipelineKey,
+  type SharedLayouts,
 } from './pipelines';
+import { ForwardPass, type DrawItem, type FrameData, type PassContext, type RenderPass, type RenderStats } from './passes';
 import { createSolidTexture, createTextureFromImage, MipmapGenerator, SamplerCache, type SamplerDesc } from './textures';
 
-export interface RendererOptions {
-  /** 1 or 4 (WebGPU guarantees 4x MSAA support for renderable formats). */
-  sampleCount?: 1 | 4;
-  clearColor?: GPUColor;
-  exposure?: number;
-  maxAnisotropy?: number;
-}
-
-export interface RenderStats {
-  drawCalls: number;
-  triangles: number;
-  pipelineSwitches: number;
-}
-
-interface DrawItem {
-  node: Node;
-  prim: GpuPrimitive;
-  sortKey: number;
-  slot: number;
-}
+export type { RenderStats } from './passes';
 
 /**
- * Forward renderer: one opaque/mask pass + blended draws last, 4x MSAA
- * resolved straight into the swap-chain texture.
+ * Frame orchestrator. Each frame it:
+ *   1. updates camera + scene transforms,
+ *   2. builds one sorted draw list and uploads all per-draw matrices at once,
+ *   3. fills frame uniforms, lets passes `prepare` (e.g. write light matrices),
+ *   4. records every enabled pass in order into one command encoder.
+ *
+ * Which passes exist and which shader features are compiled in are decided
+ * once from the RendererConfig (see createPasses / features.ts).
  *
  * Bind group frequency:
- *   group 0 – per frame  (camera, light, ambient)
- *   group 1 – per material (factors + 5 textures + sampler)
+ *   group 0 – per frame  (camera, light, ambient [+ feature bindings, e.g. shadow map])
+ *   group 1 – per material (factors + 5 textures + sampler) – feature-independent
  *   group 2 – per draw  (model/normal matrices via one dynamic-offset buffer)
  */
 export class Renderer {
   readonly device: GPUDevice;
-  readonly layouts: BindGroupLayouts;
+  readonly config: ResolvedRendererConfig;
+  readonly features: ShaderFeatures;
+  readonly layouts: SharedLayouts;
   readonly samplers: SamplerCache;
   readonly stats: RenderStats = { drawCalls: 0, triangles: 0, pipelineSwitches: 0 };
+  readonly passes: readonly RenderPass[];
 
   exposure: number;
-  clearColor: GPUColor;
 
-  private readonly sampleCount: number;
   private readonly pipelines: PipelineCache;
   private readonly mipmaps: MipmapGenerator;
   private readonly defaults: { white: GPUTexture; flatNormal: GPUTexture; black: GPUTexture };
 
   private readonly frameBuffer: GPUBuffer;
-  private readonly frameBindGroup: GPUBindGroup;
-  private readonly frameData = new Float32Array(FRAME_UNIFORM_SIZE / 4);
+  private frameBindGroup!: GPUBindGroup;
+  private readonly frameData: Float32Array<ArrayBuffer>;
 
   private readonly drawStride: number;
   private drawCapacity = 0;
@@ -64,41 +54,68 @@ export class Renderer {
   private drawBindGroup!: GPUBindGroup;
   private drawStaging = new Float32Array(0);
 
-  private msaaTexture: GPUTexture | null = null;
-  private depthTexture: GPUTexture | null = null;
+  private width = 0;
+  private height = 0;
   private nextMaterialId = 1;
   private readonly drawList: DrawItem[] = [];
 
-  constructor(private readonly gpu: GpuContext, opts: RendererOptions = {}) {
+  constructor(private readonly gpu: GpuContext, config: RendererConfig = {}) {
     const device = (this.device = gpu.device);
-    this.sampleCount = opts.sampleCount ?? 4;
-    this.clearColor = opts.clearColor ?? { r: 0.06, g: 0.06, b: 0.08, a: 1 };
-    this.exposure = opts.exposure ?? 1;
+    this.config = resolveRendererConfig(config);
+    this.features = featuresFromConfig(this.config);
+    this.exposure = this.config.exposure;
 
-    this.layouts = createBindGroupLayouts(device);
-    this.pipelines = new PipelineCache(device, this.layouts, gpu.colorFormat, this.sampleCount);
+    this.layouts = createSharedLayouts(device);
+    this.pipelines = new PipelineCache(device, this.layouts, gpu.colorFormat, this.config.msaa);
     this.mipmaps = new MipmapGenerator(device);
-    this.samplers = new SamplerCache(device, opts.maxAnisotropy ?? 8);
+    this.samplers = new SamplerCache(device, this.config.maxAnisotropy);
     this.defaults = {
       white: createSolidTexture(device, [255, 255, 255, 255], false, 'default white'),
       flatNormal: createSolidTexture(device, [128, 128, 255, 255], false, 'default normal'),
       black: createSolidTexture(device, [0, 0, 0, 255], false, 'default black'),
     };
 
+    const frameSize = frameUniformSize(this.features);
+    this.frameData = new Float32Array(frameSize / 4);
     this.frameBuffer = device.createBuffer({
       label: 'frame uniforms',
-      size: FRAME_UNIFORM_SIZE,
+      size: frameSize,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.frameBindGroup = device.createBindGroup({
-      label: 'frame',
-      layout: this.layouts.frame,
-      entries: [{ binding: 0, resource: { buffer: this.frameBuffer } }],
     });
 
     const align = device.limits.minUniformBufferOffsetAlignment;
     this.drawStride = Math.ceil(DRAW_UNIFORM_SIZE / align) * align;
     this.ensureDrawCapacity(64);
+
+    const ctx: PassContext = {
+      device, gpu, config: this.config, features: this.features, layouts: this.layouts, pipelines: this.pipelines,
+    };
+    this.passes = this.createPasses();
+    for (const p of this.passes) p.setup(ctx);
+    this.rebuildFrameBindGroup();
+  }
+
+  /**
+   * The ordered pass list for this config. Feature passes go before the
+   * forward pass that consumes their output, e.g.:
+   *
+   *   if (this.config.shadows) passes.push(new ShadowPass());   // see passes/shadowPass.ts
+   */
+  private createPasses(): RenderPass[] {
+    const passes: RenderPass[] = [];
+    passes.push(new ForwardPass());
+    return passes;
+  }
+
+  /** Rebuild group 0 (call if a pass replaces a resource it exposes, e.g. shadow map resize). */
+  rebuildFrameBindGroup(): void {
+    const entries: GPUBindGroupEntry[] = [{ binding: FRAME_BINDING.uniforms, resource: { buffer: this.frameBuffer } }];
+    for (const p of this.passes) if (p.frameBindGroupEntries) entries.push(...p.frameBindGroupEntries());
+    this.frameBindGroup = this.device.createBindGroup({
+      label: 'frame',
+      layout: this.pipelines.frameLayout(this.features),
+      entries,
+    });
   }
 
   // ---------------------------------------------------------------- resources
@@ -131,7 +148,7 @@ export class Renderer {
       ],
     });
     // Pre-warm the pipeline variant so the first frame doesn't hitch.
-    this.pipelines.get(desc.alphaMode, desc.doubleSided);
+    this.pipelines.get(this.features, desc.alphaMode, desc.doubleSided);
     const id = this.nextMaterialId++;
     return {
       id,
@@ -154,9 +171,14 @@ export class Renderer {
   render(scene: Scene, camera: PerspectiveCamera): void {
     const { device, gpu } = this;
     const swapTexture = gpu.context.getCurrentTexture();
-    this.ensureRenderTargets(swapTexture.width, swapTexture.height);
+    const { width, height } = swapTexture;
+    if (width !== this.width || height !== this.height) {
+      this.width = width;
+      this.height = height;
+      for (const p of this.passes) p.resize(width, height);
+    }
 
-    camera.aspect = swapTexture.width / swapTexture.height;
+    camera.aspect = width / height;
     camera.update();
     scene.update();
 
@@ -181,95 +203,49 @@ export class Renderer {
     }
     if (list.length) device.queue.writeBuffer(this.drawBuffer, 0, this.drawStaging, 0, list.length * strideF);
 
-    this.writeFrameUniforms(scene, camera);
-
-    const encoder = device.createCommandEncoder({ label: 'frame' });
-    const swapView = swapTexture.createView({ format: gpu.colorFormat });
-    const msaa = this.sampleCount > 1;
-    const pass = encoder.beginRenderPass({
-      label: 'main',
-      colorAttachments: [{
-        view: msaa ? this.msaaTexture!.createView() : swapView,
-        resolveTarget: msaa ? swapView : undefined,
-        clearValue: this.clearColor,
-        loadOp: 'clear',
-        // MSAA samples are only needed until resolve; discarding saves bandwidth (big win on tilers).
-        storeOp: msaa ? 'discard' : 'store',
-      }],
-      depthStencilAttachment: {
-        view: this.depthTexture!.createView(),
-        depthClearValue: 1,
-        depthLoadOp: 'clear',
-        depthStoreOp: 'discard',
-      },
-    });
-
-    pass.setBindGroup(0, this.frameBindGroup);
     const stats = this.stats;
     stats.drawCalls = stats.triangles = stats.pipelineSwitches = 0;
-    let curPipeline: GPURenderPipeline | null = null;
-    let curMaterial: GpuMaterial | null = null;
-    let curPrim: GpuPrimitive | null = null;
-    const dynOffset = [0];
+    const frame: FrameData = {
+      scene, camera,
+      drawList: list,
+      drawBindGroup: this.drawBindGroup,
+      drawStride: this.drawStride,
+      frameBindGroup: this.frameBindGroup,
+      frameUniforms: this.frameData,
+      swapTexture,
+      swapView: swapTexture.createView({ format: gpu.colorFormat }),
+      width, height,
+      stats,
+    };
 
-    for (const { prim, slot } of list) {
-      const m = prim.material;
-      const pipeline = this.pipelines.get(m.alphaMode, m.doubleSided);
-      if (pipeline !== curPipeline) {
-        pass.setPipeline(pipeline);
-        curPipeline = pipeline;
-        stats.pipelineSwitches++;
-      }
-      if (m !== curMaterial) {
-        pass.setBindGroup(1, m.bindGroup);
-        curMaterial = m;
-      }
-      dynOffset[0] = slot * this.drawStride;
-      pass.setBindGroup(2, this.drawBindGroup, dynOffset);
-      if (prim !== curPrim) {
-        for (let s = 0; s < 4; s++) pass.setVertexBuffer(s, prim.vertexBuffers[s]);
-        pass.setIndexBuffer(prim.indexBuffer, prim.indexFormat);
-        curPrim = prim;
-      }
-      pass.drawIndexed(prim.indexCount);
-      stats.drawCalls++;
-      stats.triangles += prim.indexCount / 3;
-    }
+    this.fillFrameUniforms(scene, camera);
+    for (const p of this.passes) if (p.enabled) p.prepare?.(frame);
+    device.queue.writeBuffer(this.frameBuffer, 0, this.frameData);
 
-    pass.end();
+    const encoder = device.createCommandEncoder({ label: 'frame' });
+    for (const p of this.passes) if (p.enabled) p.execute(encoder, frame);
     device.queue.submit([encoder.finish()]);
   }
 
-  private writeFrameUniforms(scene: Scene, camera: PerspectiveCamera): void {
-    const f = this.frameData;
-    const { light, ambient } = scene;
-    f.set(camera.viewProjection, 0);
-    f.set([camera.position[0], camera.position[1], camera.position[2], 1], 16);
-    const len = Math.hypot(light.direction[0], light.direction[1], light.direction[2]) || 1;
-    f.set([light.direction[0] / len, light.direction[1] / len, light.direction[2] / len, 0], 20);
-    f.set([light.color[0] * light.intensity, light.color[1] * light.intensity, light.color[2] * light.intensity, 1], 24);
-    f.set([ambient.skyColor[0] * ambient.intensity, ambient.skyColor[1] * ambient.intensity, ambient.skyColor[2] * ambient.intensity, 1], 28);
-    f.set([ambient.groundColor[0] * ambient.intensity, ambient.groundColor[1] * ambient.intensity, ambient.groundColor[2] * ambient.intensity, 1], 32);
-    f.set([this.exposure, 0, 0, 0], 36);
-    this.device.queue.writeBuffer(this.frameBuffer, 0, f);
+  destroy(): void {
+    for (const p of this.passes) p.destroy();
+    this.frameBuffer.destroy();
+    this.drawBuffer.destroy();
   }
 
-  private ensureRenderTargets(width: number, height: number): void {
-    const cur = this.depthTexture;
-    if (cur && cur.width === width && cur.height === height) return;
-    this.msaaTexture?.destroy();
-    this.depthTexture?.destroy();
-    const size = [width, height];
-    this.msaaTexture = this.sampleCount > 1
-      ? this.device.createTexture({
-          label: 'msaa color', size, sampleCount: this.sampleCount,
-          format: this.gpu.colorFormat, usage: GPUTextureUsage.RENDER_ATTACHMENT,
-        })
-      : null;
-    this.depthTexture = this.device.createTexture({
-      label: 'depth', size, sampleCount: this.sampleCount,
-      format: DEPTH_FORMAT, usage: GPUTextureUsage.RENDER_ATTACHMENT,
-    });
+  private fillFrameUniforms(scene: Scene, camera: PerspectiveCamera): void {
+    const f = this.frameData;
+    const L = FRAME_LAYOUT;
+    const { light, ambient } = scene;
+    f.set(camera.viewProjection, L.viewProj);
+    f.set([camera.position[0], camera.position[1], camera.position[2], 1], L.cameraPos);
+    const len = Math.hypot(light.direction[0], light.direction[1], light.direction[2]) || 1;
+    f.set([light.direction[0] / len, light.direction[1] / len, light.direction[2] / len, 0], L.lightDir);
+    f.set([light.color[0] * light.intensity, light.color[1] * light.intensity, light.color[2] * light.intensity, 1], L.lightColor);
+    f.set([ambient.skyColor[0] * ambient.intensity, ambient.skyColor[1] * ambient.intensity, ambient.skyColor[2] * ambient.intensity, 1], L.skyColor);
+    f.set([ambient.groundColor[0] * ambient.intensity, ambient.groundColor[1] * ambient.intensity, ambient.groundColor[2] * ambient.intensity, 1], L.groundColor);
+    f.set([this.exposure, 0, 0, 0], L.params);
+    // SHADOWS-only fields (lightViewProj, shadowParams) are written by the shadow pass in prepare().
   }
 
   private ensureDrawCapacity(count: number): void {

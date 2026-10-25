@@ -18,6 +18,7 @@ npm run dev        # http://localhost:5173  (WebGPU needs https or localhost)
 npm run build      # type-check + production bundle in dist/
 npm run preview    # serve dist/
 npm run screenshot # headless Chrome + SwiftShader render -> screenshot.png (after build)
+npm run check:shaders # compile + validate every shader feature variant (incl. disabled ones)
 ```
 
 URL options: `?model=/path/to/file.glb` (or `.gltf`), `?msaa=1` (disable 4x MSAA),
@@ -33,14 +34,19 @@ src/
   core/        gpu.ts        adapter/device/canvas setup, clear "WebGPU unsupported" errors, device-lost hook
                resize.ts     ResizeObserver (device-pixel-content-box) -> canvas size * DPR, optional DPR cap
                frameLoop.ts  rAF loop with clamped dt
-  renderer/    renderer.ts   forward renderer: 4x MSAA -> resolve into swap chain, depth, draw sorting
-               pipelines.ts  bind-group layouts, vertex layouts, pipeline-variant cache (alpha mode x culling)
+  renderer/    renderer.ts   frame orchestrator: draw list, uniforms, runs the ordered pass list
+               config.ts     RendererConfig ({ msaa, shadows, ... }) -> resolved config
+               features.ts   compile-time shader feature set (-> WGSL defines, cache keys)
+               shaderPreprocessor.ts  tiny `#if NAME / #else / #endif` for WGSL
+               passes/       RenderPass interface, ForwardPass (MSAA + depth), shadowPass.ts (design stub only)
+               pipelines.ts  bind-group layouts, vertex layouts, pipeline cache (features x alpha mode x culling)
                material.ts   material description + uniform packing + sort keys
                mesh.ts       GPU buffers for primitives (non-interleaved streams)
                textures.ts   image upload, GPU mipmap generation, 1x1 defaults, sampler cache
   scene/       node.ts       scene graph: TRS -> local/world/normal matrices with dirty flags
                camera.ts     perspective camera (WebGPU 0..1 depth)
                scene.ts      scene root, one directional light, hemisphere ambient
+               lighting.ts   light-space matrix from scene bounds (hook for shadows)
                bounds.ts     AABB helpers (framing; later culling)
   assets/      gltf.ts       glTF 2.0 / GLB parser -> engine-neutral CPU data (no GPU calls)
                geometry.ts   generate missing normals / tangents, bounds
@@ -71,6 +77,47 @@ src/
   and allow a depth-only pass to bind positions alone later.
 - **Tangents generated only when a normal map needs them**; missing normals are computed.
 
+## Extending the renderer / adding shadows later
+
+The renderer is a small pass system driven by one config object:
+
+```ts
+const renderer = new Renderer(gpu, { msaa: 4, shadows: false }); // defaults
+```
+
+- **Passes.** `Renderer.createPasses()` builds an ordered `RenderPass[]` from the config. Every
+  pass implements `setup / resize / prepare? / execute / destroy` (`renderer/passes/pass.ts`).
+  The Renderer builds the per-frame data once (sorted draw list, per-draw matrices, frame
+  uniforms) and hands it to each enabled pass in order, all recorded into one command encoder.
+  Today the list is just `[ForwardPass]`.
+- **Shader features.** `features.ts` turns the config into a `ShaderFeatures` set, which becomes
+  WGSL `#if` defines (`SHADOWS`, ...) via `shaderPreprocessor.ts`. Shader modules, the group-0
+  layout and pipelines are cached per feature set, so variants never collide.
+- **Stable bind-group contract.** Only group 0 (per-frame/lighting) varies with features; slots are
+  reserved in `FRAME_BINDING` (0 = uniforms, 1 = shadow map, 2 = comparison sampler) and the
+  uniform layout in `FRAME_LAYOUT` (`lightViewProj`, `shadowParams` appended only when enabled).
+  Materials (group 1) and per-draw data (group 2) never change, so materials need no rework.
+  Passes contribute their group-0 resources through `frameBindGroupEntries()`.
+- **Zero cost when off.** With `shadows: false` there is no shadow pass, texture, binding,
+  uniform bytes (frame block stays 160 B) or shader code; the light visibility term is a
+  constant `1.0` (trivially constant-folded). Output is pixel-identical to before the refactor.
+
+**Adding shadows** is a drop-in change (full checklist in `src/renderer/passes/shadowPass.ts`):
+
+1. Implement `ShadowPass` (depth-only pass into a `depth32float` map using `POSITION_ONLY_LAYOUT`
+   and the shared per-draw bind group; in `prepare` compute the light matrix with
+   `computeDirectionalLightViewProj(scene.light, bounds)` from `scene/lighting.ts` and write it
+   at `FRAME_LAYOUT.lightViewProj`; expose map + comparison sampler via `frameBindGroupEntries`).
+2. Register it before `ForwardPass` in `createPasses()` when `config.shadows` is set.
+3. Flip `SHADOW_PASS_IMPLEMENTED` in `config.ts` (until then `shadows: true` logs a warning and is ignored).
+4. Replace the single-tap placeholder in `directionalLightVisibility()` (pbr.wgsl) with real
+   filtering (PCF/PCSS, cascades) if desired.
+
+`npm run check:shaders` already compiles the `SHADOWS` variant and validates its pipelines
+against the reserved layout, so the contract stays correct while the feature is off.
+Other features (IBL, fog, clustered lights, post-processing) follow the same recipe: a flag, a
+define, guarded WGSL, an optional pass, and if needed a reserved group-0 slot.
+
 ### glTF support
 
 `.glb` and `.gltf` (external files or data URIs); TRIANGLES primitives; POSITION, NORMAL,
@@ -84,7 +131,7 @@ textures with samplers; alpha OPAQUE / MASK / BLEND; doubleSided; `KHR_materials
 - No animation, skinning, morph targets, cameras or lights from glTF; no Draco/meshopt; KTX2 not yet.
 - BLEND materials are drawn after opaques but not sorted back-to-front.
 - No frustum culling or instancing yet; draw list is rebuilt every frame.
-- Ambient is a hemisphere term + analytic env-BRDF, not image-based lighting; no shadows.
+- Ambient is a hemisphere term + analytic env-BRDF, not image-based lighting; no shadows yet (architecture ready, see above).
 - Tangent generation is Lengyel-style, not full MikkTSpace (the baker should emit MikkTSpace tangents).
 
 ## Roadmap
@@ -100,7 +147,7 @@ textures with samplers; alpha OPAQUE / MASK / BLEND; doubleSided; `KHR_materials
 5. **Asset baking pipeline (shared across engines):** glTF in -> per-platform packages out: quantized
    and interleaved vertex layouts, meshopt-optimized index order, MikkTSpace tangents, LODs,
    GPU-compressed textures, a tiny binary header the runtime can map straight into GPU buffers.
-6. Then: IBL (prefiltered env + BRDF LUT baked offline), shadow maps, a render-graph-lite for passes,
+6. Then: opt-in shadow maps (`ShadowPass`), IBL (prefiltered env + BRDF LUT baked offline),
    render bundles for static geometry, timestamp-query profiling.
 
 ## Headless screenshot notes
