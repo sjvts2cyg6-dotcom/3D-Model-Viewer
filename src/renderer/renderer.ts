@@ -3,6 +3,7 @@ import type { PerspectiveCamera } from '../scene/camera';
 import type { Scene } from '../scene/scene';
 import { resolveRendererConfig, type RendererConfig, type ResolvedRendererConfig } from './config';
 import { featuresFromConfig, type ShaderFeatures } from './features';
+import { screenSpaceLodSelector, type LodSelector, type LodSettings } from './lod';
 import { createGpuPrimitive, createBuffer, type GpuPrimitive, type PrimitiveData } from './mesh';
 import { MATERIAL_UNIFORM_SIZE, materialSortKey, packMaterialUniforms, type GpuMaterial, type MaterialDesc } from './material';
 import {
@@ -10,7 +11,10 @@ import {
   type SharedLayouts,
 } from './pipelines';
 import { ForwardPass, type DrawItem, type FrameData, type PassContext, type RenderPass, type RenderStats } from './passes';
-import { createSolidTexture, createTextureFromImage, MipmapGenerator, SamplerCache, type SamplerDesc } from './textures';
+import {
+  createSolidTexture, createTextureFromImage, createTextureFromLevels, MipmapGenerator, SamplerCache,
+  type SamplerDesc, type TextureLevelData,
+} from './textures';
 
 export type { RenderStats } from './passes';
 
@@ -35,7 +39,11 @@ export class Renderer {
   readonly features: ShaderFeatures;
   readonly layouts: SharedLayouts;
   readonly samplers: SamplerCache;
-  readonly stats: RenderStats = { drawCalls: 0, triangles: 0, pipelineSwitches: 0 };
+  readonly stats: RenderStats = { drawCalls: 0, triangles: 0, pipelineSwitches: 0, lodReducedDraws: 0 };
+  /** Runtime LOD policy (see lod.ts); tweak freely between frames. */
+  readonly lod: LodSettings;
+  /** Per-instance LOD choice; replace for custom policies (distance bands, budgets, ...). */
+  lodSelector: LodSelector = screenSpaceLodSelector;
   readonly passes: readonly RenderPass[];
 
   exposure: number;
@@ -64,6 +72,7 @@ export class Renderer {
     this.config = resolveRendererConfig(config);
     this.features = featuresFromConfig(this.config);
     this.exposure = this.config.exposure;
+    this.lod = { ...this.config.lod };
 
     this.layouts = createSharedLayouts(device);
     this.pipelines = new PipelineCache(device, this.layouts, gpu.colorFormat, this.config.msaa);
@@ -123,6 +132,21 @@ export class Renderer {
   createTexture(image: ImageBitmap, srgb: boolean, label?: string): GPUTexture {
     return createTextureFromImage(this.device, this.mipmaps, image, srgb, label);
   }
+
+  /** Upload precomputed mips (raw RGBA8 or block-compressed). */
+  createTextureFromLevels(format: GPUTextureFormat, levels: TextureLevelData[], label?: string): GPUTexture {
+    return createTextureFromLevels(this.device, format, levels, label);
+  }
+
+  /**
+   * Bound in place of absent vertex streams (e.g. no UVs / tangents in a baked
+   * primitive). Robust buffer access clamps or zeroes out-of-range fetches,
+   * and every byte here is zero, so the shader reads 0 either way.
+   */
+  get zeroVertexBuffer(): GPUBuffer {
+    return (this.zeroBuffer ??= this.device.createBuffer({ label: 'zero vertex stream', size: 64, usage: GPUBufferUsage.VERTEX }));
+  }
+  private zeroBuffer: GPUBuffer | null = null;
 
   getSampler(desc?: SamplerDesc): GPUSampler {
     return this.samplers.get(desc);
@@ -188,7 +212,10 @@ export class Renderer {
     list.length = 0;
     scene.root.traverse((node) => {
       if (!node.visible || !node.mesh) return;
-      for (const prim of node.mesh.primitives) list.push({ node, prim, sortKey: prim.material.sortKey, slot: 0 });
+      for (const prim of node.mesh.primitives) {
+        const lod = prim.lods.length > 1 ? this.lodSelector(prim, node, camera, height, this.lod) : 0;
+        list.push({ node, prim, sortKey: prim.material.sortKey, slot: 0, lod });
+      }
     });
     list.sort((a, b) => a.sortKey - b.sortKey);
 
@@ -204,7 +231,7 @@ export class Renderer {
     if (list.length) device.queue.writeBuffer(this.drawBuffer, 0, this.drawStaging, 0, list.length * strideF);
 
     const stats = this.stats;
-    stats.drawCalls = stats.triangles = stats.pipelineSwitches = 0;
+    stats.drawCalls = stats.triangles = stats.pipelineSwitches = stats.lodReducedDraws = 0;
     const frame: FrameData = {
       scene, camera,
       drawList: list,

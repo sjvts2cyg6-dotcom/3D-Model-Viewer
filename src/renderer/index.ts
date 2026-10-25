@@ -7,3 +7,4 @@ export * from './mesh';
 export * from './pipelines';
 export * from './textures';
 export * from './passes';
+export * from './lod';

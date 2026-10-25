@@ -23,12 +23,16 @@ export interface DrawItem {
   sortKey: number;
   /** Index into the per-draw uniform buffer (dynamic offset = slot * drawStride). */
   slot: number;
+  /** Selected level of detail (index into prim.lods). */
+  lod: number;
 }
 
 export interface RenderStats {
   drawCalls: number;
   triangles: number;
   pipelineSwitches: number;
+  /** Draws that used a reduced level of detail (lod > 0). */
+  lodReducedDraws: number;
 }
 
 /** Per-frame data built once by the Renderer and shared by all passes. */

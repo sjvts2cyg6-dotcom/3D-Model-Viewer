@@ -12,12 +12,32 @@ export interface PrimitiveData {
   boundsMax: Vec3;
 }
 
-export interface GpuPrimitive {
-  /** Slot order matches the pipeline's vertex buffer layouts. */
-  vertexBuffers: [position: GPUBuffer, normal: GPUBuffer, uv: GPUBuffer, tangent: GPUBuffer];
-  indexBuffer: GPUBuffer;
-  indexFormat: GPUIndexFormat;
+/** One level of detail: a sub-range of the primitive's index range. */
+export interface LodLevel {
+  /** First index, relative to `indexOffset`. */
+  firstIndex: number;
   indexCount: number;
+  /** Geometric error in mesh-local units (0 = full detail). Ascending across levels. */
+  error: number;
+}
+
+export interface GpuPrimitive {
+  /**
+   * Slot order matches the pipeline's vertex buffer layouts. Several
+   * primitives may share one GPUBuffer (baked .wgm files use a single vertex
+   * and a single index buffer per file) and address it with offsets.
+   */
+  vertexBuffers: [position: GPUBuffer, normal: GPUBuffer, uv: GPUBuffer, tangent: GPUBuffer];
+  /** Byte offsets into `vertexBuffers` (multiples of 4). */
+  vertexOffsets: [number, number, number, number];
+  indexBuffer: GPUBuffer;
+  /** Byte offset into `indexBuffer` (multiple of the index size). */
+  indexOffset: number;
+  indexFormat: GPUIndexFormat;
+  /** Full-detail index count (== lods[0].indexCount). */
+  indexCount: number;
+  /** lods[0] is full detail; always at least one entry. */
+  lods: LodLevel[];
   material: GpuMaterial;
   boundsMin: Vec3;
   boundsMax: Vec3;
@@ -46,9 +66,12 @@ export function createGpuPrimitive(device: GPUDevice, data: PrimitiveData, mater
       createBuffer(device, data.uvs, V, `${label} uv`),
       createBuffer(device, data.tangents, V, `${label} tan`),
     ],
+    vertexOffsets: [0, 0, 0, 0],
     indexBuffer: createBuffer(device, data.indices, GPUBufferUsage.INDEX, `${label} idx`),
+    indexOffset: 0,
     indexFormat: data.indices instanceof Uint16Array ? 'uint16' : 'uint32',
     indexCount: data.indices.length,
+    lods: [{ firstIndex: 0, indexCount: data.indices.length, error: 0 }],
     material,
     boundsMin: data.boundsMin,
     boundsMax: data.boundsMax,

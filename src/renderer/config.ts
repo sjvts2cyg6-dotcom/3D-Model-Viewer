@@ -4,6 +4,7 @@
  * compiled in. Disabled features cost nothing: no pass, no bindings, no
  * uniforms, no shader code.
  */
+import { DEFAULT_LOD_SETTINGS, type LodSettings } from './lod';
 
 export interface ShadowConfig {
   /** Shadow map resolution (square). */
@@ -25,6 +26,8 @@ export interface RendererConfig {
   clearColor?: GPUColor;
   exposure?: number;
   maxAnisotropy?: number;
+  /** Initial LOD policy (runtime-mutable via `renderer.lod`). */
+  lod?: Partial<LodSettings>;
 }
 
 export interface ResolvedRendererConfig {
@@ -34,6 +37,7 @@ export interface ResolvedRendererConfig {
   readonly clearColor: GPUColor;
   readonly exposure: number;
   readonly maxAnisotropy: number;
+  readonly lod: Readonly<LodSettings>;
 }
 
 export const DEFAULT_SHADOW_CONFIG: Readonly<ShadowConfig> = { mapSize: 2048, depthBias: 0.002, normalBias: 1.5 };
@@ -56,5 +60,6 @@ export function resolveRendererConfig(c: RendererConfig = {}): ResolvedRendererC
     clearColor: c.clearColor ?? { r: 0.06, g: 0.06, b: 0.08, a: 1 },
     exposure: c.exposure ?? 1,
     maxAnisotropy: c.maxAnisotropy ?? 8,
+    lod: { ...DEFAULT_LOD_SETTINGS, ...c.lod },
   };
 }

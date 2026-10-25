@@ -125,3 +125,49 @@ export class SamplerCache {
     return s;
   }
 }
+
+/** Block footprint of the texture formats the asset loaders upload directly. */
+export function formatBlockInfo(format: GPUTextureFormat): { blockWidth: number; blockHeight: number; bytesPerBlock: number } {
+  if (format.startsWith('bc7') || format.startsWith('bc3') || format.startsWith('astc-4x4') || format.startsWith('etc2-rgba8')) {
+    return { blockWidth: 4, blockHeight: 4, bytesPerBlock: 16 };
+  }
+  if (format.startsWith('bc1') || format.startsWith('etc2-rgb8')) return { blockWidth: 4, blockHeight: 4, bytesPerBlock: 8 };
+  if (format.startsWith('rgba8')) return { blockWidth: 1, blockHeight: 1, bytesPerBlock: 4 };
+  throw new Error(`formatBlockInfo: unsupported format ${format}`);
+}
+
+export interface TextureLevelData {
+  /** Tightly packed level data (rows of blocks / texels). */
+  data: Uint8Array;
+  /** Logical (unpadded) size of this level. */
+  width: number;
+  height: number;
+}
+
+/**
+ * Creates a texture from precomputed mip levels (raw RGBA8 or block-compressed)
+ * with one writeTexture per level; no GPU-side mip generation.
+ */
+export function createTextureFromLevels(
+  device: GPUDevice, format: GPUTextureFormat, levels: TextureLevelData[], label?: string,
+): GPUTexture {
+  const { blockWidth, blockHeight, bytesPerBlock } = formatBlockInfo(format);
+  const texture = device.createTexture({
+    label,
+    size: [levels[0].width, levels[0].height],
+    format,
+    mipLevelCount: levels.length,
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  levels.forEach((l, mipLevel) => {
+    const bx = Math.ceil(l.width / blockWidth), by = Math.ceil(l.height / blockHeight);
+    // Copy extents of compressed levels cover whole blocks (the physical mip size).
+    device.queue.writeTexture(
+      { texture, mipLevel },
+      l.data,
+      { bytesPerRow: bx * bytesPerBlock, rowsPerImage: by },
+      [bx * blockWidth, by * blockHeight],
+    );
+  });
+  return texture;
+}

@@ -64,7 +64,7 @@ export class ForwardPass implements RenderPass {
     let curPrim: GpuPrimitive | null = null;
     const dynOffset = [0];
 
-    for (const { prim, slot } of frame.drawList) {
+    for (const { prim, slot, lod } of frame.drawList) {
       const m = prim.material;
       const pipeline = pipelines.get(features, m.alphaMode, m.doubleSided);
       if (pipeline !== curPipeline) {
@@ -79,13 +79,15 @@ export class ForwardPass implements RenderPass {
       dynOffset[0] = slot * frame.drawStride;
       pass.setBindGroup(2, frame.drawBindGroup, dynOffset);
       if (prim !== curPrim) {
-        for (let s = 0; s < 4; s++) pass.setVertexBuffer(s, prim.vertexBuffers[s]);
-        pass.setIndexBuffer(prim.indexBuffer, prim.indexFormat);
+        for (let s = 0; s < 4; s++) pass.setVertexBuffer(s, prim.vertexBuffers[s], prim.vertexOffsets[s]);
+        pass.setIndexBuffer(prim.indexBuffer, prim.indexFormat, prim.indexOffset);
         curPrim = prim;
       }
-      pass.drawIndexed(prim.indexCount);
+      const level = prim.lods[lod];
+      pass.drawIndexed(level.indexCount, 1, level.firstIndex);
       stats.drawCalls++;
-      stats.triangles += prim.indexCount / 3;
+      stats.triangles += level.indexCount / 3;
+      if (lod > 0) stats.lodReducedDraws++;
     }
     pass.end();
   }
