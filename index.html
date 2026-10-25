@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>WebGPU Engine</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html, body { margin: 0; height: 100%; background: #101014; overflow: hidden; }
+      #view { display: block; width: 100vw; height: 100vh; touch-action: none; }
+      #hud {
+        position: fixed; left: 8px; top: 8px; padding: 4px 8px; border-radius: 4px;
+        font: 12px/1.4 ui-monospace, monospace; color: #cfd3dc; background: rgba(0,0,0,.45);
+        pointer-events: none; white-space: pre;
+      }
+      #error {
+        position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+        padding: 24px; font: 16px/1.5 system-ui, sans-serif; color: #ffd7d7; background: #1a0f12; text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="hud"></div>
+    <div id="error"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

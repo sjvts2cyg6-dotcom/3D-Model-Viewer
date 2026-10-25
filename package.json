@@ -1,0 +1,23 @@
+{
+  "name": "webgpu-engine",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Minimal, dependency-light WebGPU rendering engine skeleton (browser target).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "screenshot": "node scripts/screenshot.mjs"
+  },
+  "dependencies": {
+    "wgpu-matrix": "^3.4.2"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.74",
+    "puppeteer-core": "^24.43.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  }
+}
