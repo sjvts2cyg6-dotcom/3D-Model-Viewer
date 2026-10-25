@@ -161,3 +161,10 @@ CPU-rendered and meaningless for performance.
 ## License
 
 The engine source code is released under the [MIT License](LICENSE).
+
+## Testing credits
+
+These sample models were used only to test the engine during development. They are **not included** in this repository, and the MIT license above does not apply to them.
+
+- **DamagedHelmet**, from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/DamagedHelmet) repository. © 2018 ctxwing (rebuild and conversion to glTF), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode); based on an earlier model © 2016 theblueturtle_, licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/legalcode).
+- **BoxTextured**, from the [Khronos glTF-Sample-Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/BoxTextured) repository. © 2017 Cesium, licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode).
