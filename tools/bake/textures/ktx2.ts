@@ -5,8 +5,12 @@
  *
  *   color  (base colour, emissive): ETC1S (default) or UASTC, sRGB transfer fn,
  *          perceptual metrics, mips filtered in linear light.
- *   normal: UASTC + Zstd, normal-map preset, linear, renormalised mips.
- *   data   (metallic-roughness / occlusion): UASTC + Zstd, linear, linear mips.
+ *   normal: UASTC, normal-map preset, linear, renormalised mips.
+ *   data   (metallic-roughness / occlusion): UASTC, linear, linear mips.
+ *
+ * Used (a) as the offline intermediate for native BC7/ETC2 (textures/native.ts)
+ * and (b) for the opt-in `universal` texture mode, the only mode transcoded at
+ * load. Zstd supercompression is off unless explicitly requested (`--zstd`).
  */
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -48,6 +52,8 @@ export interface Ktx2Options {
   uastcLevel: number;
   /** Enable UASTC RDO (smaller after Zstd, slightly lower quality). */
   uastcRdo: boolean;
+  /** Zstd supercompression of UASTC (needs decompression at load; opt-in only). */
+  zstd: boolean;
 }
 
 /** Encode one image (dimensions must be multiples of 4) into a KTX2 file with a full mip chain. */
@@ -73,7 +79,7 @@ export async function encodeKtx2(img: RgbaImage, opts: Ktx2Options): Promise<Uin
     enc.setMipRenormalize(opts.usage === 'normal');
     enc.setMipSmallestDimension(1);
     if (opts.codec === 'uastc') {
-      enc.setKTX2UASTCSupercompression(true);
+      enc.setKTX2UASTCSupercompression(opts.zstd);
       enc.setPackUASTCFlags(opts.uastcLevel);
       if (opts.uastcRdo && opts.usage !== 'normal') enc.setRDOUASTC(true);
     } else {

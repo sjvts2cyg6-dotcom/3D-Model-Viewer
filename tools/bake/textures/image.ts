@@ -122,12 +122,18 @@ export function buildMipChain(base: RgbaImage, mode: MipMode): RgbaImage[] {
 }
 
 /** Fit inside maxSize (keeping aspect) and optionally round each side up to a multiple of `multiple`. */
-export function targetSize(w: number, h: number, maxSize: number, multiple: number): [number, number] {
+export function targetSize(w: number, h: number, maxSize: number, multiple: number | [number, number]): [number, number] {
+  const [mx, my] = typeof multiple === 'number' ? [multiple, multiple] : multiple;
   const s = Math.min(1, maxSize / Math.max(w, h));
   let tw = Math.max(1, Math.round(w * s)), th = Math.max(1, Math.round(h * s));
-  if (multiple > 1) {
-    tw = Math.ceil(tw / multiple) * multiple;
-    th = Math.ceil(th / multiple) * multiple;
-  }
+  // Block formats need level 0 in whole blocks: round to the nearest multiple,
+  // never above maxSize (unless maxSize is smaller than one block).
+  const fit = (v: number, m: number) => {
+    if (m <= 1) return v;
+    const cap = Math.max(m, Math.floor(maxSize / m) * m);
+    return Math.min(cap, Math.max(m, Math.round(v / m) * m));
+  };
+  tw = fit(tw, mx);
+  th = fit(th, my);
   return [tw, th];
 }
