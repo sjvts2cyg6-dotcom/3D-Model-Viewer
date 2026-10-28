@@ -82,7 +82,7 @@ Rejected reports never advance the orchestrator; it keeps waiting until the time
 
 ```
 wgm-bake <input.glb|.gltf> [-o dir] [--device <file|-|auto|preset>] [--detail low|medium|high|max]
-         [--max-triangles N] [reduction knobs: --lods, --lod-ratio, --max-texture-size, --texture-format,
+         [--max-triangles N] [--max-drawn-triangles N] [reduction knobs: --lods, --lod-ratio, --max-texture-size, --texture-format,
           --astc-block, --vertex-precision, --normal-encoding, --pixel-error, …]
          [--json] [--print-device]
 ```
@@ -91,9 +91,14 @@ wgm-bake <input.glb|.gltf> [-o dir] [--device <file|-|auto|preset>] [--detail lo
   Chrome probe of this machine (SwiftShader on GPU-less hosts; needs `npm run build`).
   A bare preset name (`desktop-1080p`, `phone`, `phone-etc2`) or `preset:<name>` loads a built-in
   profile from `tools/bake/presets/`; presets are **estimates**, not measurements (source `"preset"`).
-- `--detail` scales what the profile allows (texture cap from screen size × 0.5/1/2/∞; triangle
-  budget ×0.25/1/4/unlimited around desktop 2M, mobile 300k, software 100k; vertex tolerance
+- `--detail` scales what the profile allows (texture cap from screen size × 0.5/1/2/∞; LOD0 triangle
+  budget ×0.25/1/4/unlimited around desktop 2M, mobile 300k, software 100k; drawn-triangle estimate
+  around desktop 5M, mobile 750k, software 250k; vertex tolerance
   1/0.5/0.25/0.1 px, 1°/0.5°/0.25°/0.05°; ASTC 6x6 instead of 4x4 at `low`).
+- `maxTriangles` (`--max-triangles`) counts **unique** geometry: each mesh once, instances ignored. It
+  reduces LOD0, never past the pixel tolerance. `maxDrawnTriangles` (`--max-drawn-triangles`) counts the
+  scene **as drawn** (instances included); it only adds LOD levels and never changes LOD0. Both appear in
+  the `device` event's `options` and in the result's `options`.
 - The profile's `gpu.textureCompression` picks a **native** texture format (`options.textureFormat`
   in the `device` event): `astc` (mobile, or no BC), `bc7`, `etc2`, `rgba8`, or `each` if WebGPU was
   unavailable. Nothing in such files is transcoded or decompressed at load. `--texture-format universal`
@@ -112,7 +117,7 @@ One JSON object per stdout line, each with `event` and `t` (ms since start). Hum
 | `profile` | (only `--print-device`) `source: "file"\|"stdin"\|"headless"`, `profile` |
 | `device` | `source` (`file`\|`stdin`\|`headless`\|`preset`), `summary` (class, gpu, screen, compression, detail, probedAt, headless), `decisions[]`, `options` (incl. `textureFormat`, `astcBlock`, `vertexTolerance`), `overriddenByFlags[]` |
 | `output` | (only `--texture-format each`) one per written file, same fields as `result` |
-| `result` | `output` (absolute path), `inputBytes`, `outputBytes`, `ms`, `target`, `options`, `stats` (incl. `vertexBytesF32`, `vertexBytes`, `vertexFormats`, `maxPositionPixelError`, `maxNormalErrorDeg`, `maxUvErrorTexels`, `textureFormats`, `textureBytes`), `device` (summary or null). With `--texture-format each`: `output` is the template `<dir>/<name>.{tex}.wgm` (the viewer resolves `{tex}`), `outputs[]` lists the files, and `stats`/`outputBytes` are omitted (see the `output` events). |
+| `result` | `output` (absolute path), `inputBytes`, `outputBytes`, `ms`, `target`, `options`, `stats` (incl. `vertexBytesF32`, `vertexBytes`, `vertexFormats`, `maxPositionPixelError`, `maxNormalErrorDeg`, `maxUvErrorTexels`, `textureFormats`, `textureBytes`, `sourceUniqueTriangles`, `sourceDrawnTriangles`, `instances`, `lod0BudgetRatio`, `lodLevels`, `triangles` (unique LOD0), `lodTriangles[]` (unique, per level), `drawnTrianglesLod0`, `drawnTrianglesCoarsest`), `device` (summary or null). With `--texture-format each`: `output` is the template `<dir>/<name>.{tex}.wgm` (the viewer resolves `{tex}`), `outputs[]` lists the files, and `stats`/`outputBytes` are omitted (see the `output` events). |
 | `error` | `code`, `exitCode`, `message` |
 
 ### Exit codes

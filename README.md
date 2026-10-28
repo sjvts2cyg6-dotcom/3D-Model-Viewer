@@ -169,7 +169,7 @@ textures with samplers; alpha OPAQUE / MASK / BLEND; doubleSided; `KHR_materials
 | App | Command / URL | What it does |
 |---|---|---|
 | **Probe** | `/probe.html` | Runs on the target device's browser. Reads WebGPU adapter info, features, limits, texture-compression support, screen/DPR, memory, and a short fill-rate benchmark into a **DeviceProfile** JSON. Standalone it shows the profile and offers *Download device-profile.json*. |
-| **Baker** | `npm run bake -- in.glb --device profile.json` | Bakes glTF, tailored to a profile: caps texture size to the screen and GPU limits, sets a triangle budget for the device class, picks the LOD policy. `--json` for NDJSON events, with meaningful exit codes. |
+| **Baker** | `npm run bake -- in.glb --device profile.json` | Bakes glTF, tailored to a profile: caps texture size to the screen and GPU limits, sets a LOD0 triangle budget on unique geometry and a drawn-triangle estimate (instances) for LOD depth. `--json` for NDJSON events, with meaningful exit codes. |
 | **Orchestrator** | `npm run local -- in.glb` | Same-machine convenience. Opens the probe in your **real default browser**, receives the profile over a loopback HTTP report, then runs the baker as a separate process with that profile. Optionally opens the viewer on the result. |
 
 The three only talk through documented interfaces (URL params, HTTP report, CLI args, stdin,
@@ -209,10 +209,20 @@ npm run bake -- --device profile.json --print-device --json               # just
 
 - `--detail low|medium|high|max` scales the texture cap (longest physical screen side × 0.5/1/2/∞,
   power of two, ≤ GPU `maxTextureDimension2D`, ≤ 4096; mobile ≤ 2048 below high; software ≤ 1024;
-  ≤ 2 GB RAM ≤ 1024) and the triangle budget (desktop 2M, mobile 300k, software 100k at medium;
-  ×0.25 / ×4 / unlimited).
-- `--max-triangles N` sets the budget directly. When the drawn scene (counting instances) is over budget,
-  LOD0 of every primitive is simplified by budget/drawn and the LOD chain continues from there.
+  ≤ 2 GB RAM ≤ 1024) and two separate triangle numbers (×0.25 / ×4 / unlimited for low/high/max):
+  - **LOD0 budget, unique geometry** (`--max-triangles N`; desktop 2M, mobile 300k, software 100k at
+    medium): each mesh is counted **once**, however many nodes instance it (and primitives with identical
+    positions + indices once, even across separate meshes). Over budget, every primitive's LOD0 is simplified by budget/unique, **but never past the
+    position pixel tolerance** (`--pixel-error` px at the profile's screen size with the mesh filling the
+    screen), so detail the device can display is kept even if the budget is then exceeded. N instances of a
+    mesh get exactly the same LOD0 as one.
+  - **Drawn-triangle estimate, instances counted** (`--max-drawn-triangles N`; desktop 5M, mobile 750k,
+    software 250k at medium; a guess, not a measurement): never touches LOD0. When the scene as drawn at
+    LOD0 exceeds it, the LOD chain gets more levels (up to 8, each `--lod-ratio` of the previous, still capped
+    by `--lod-max-error`) so the runtime LOD selector can draw distant copies coarser.
+  The `result` stats report `sourceUniqueTriangles`, `sourceDrawnTriangles`, `instances`, `lod0BudgetRatio`,
+  `lodLevels`, `triangles` (unique LOD0 after the bake), `lodTriangles` (unique, per level),
+  `drawnTrianglesLod0` and `drawnTrianglesCoarsest` (all instances).
 - **Texture format** from the profile's `textureCompression` (always native, never transcoded at load):
   ASTC on mobile (or any device without BC; block 6x6 at `--detail low`, else 4x4), BC7 on desktop/software
   with BC, ETC2 if that is all there is, RGBA8 if there is no compression, and `each` (one file per format)
@@ -265,7 +275,7 @@ npm run bake -- <input.glb|.gltf> -o <outdir> [--target webgpu] [--lods N]
 #   --texture-format auto|bc7|astc|etc2|rgba8|each|universal   --astc-block 4x4|5x5|6x6|8x8  --astc-quality fast|medium|thorough
 #   --vertex-precision auto|full|low  --normal-encoding auto|oct  --pixel-error PX
 #   --lod-ratio 0.5  --lod-max-error 0.05  --max-texture-size 4096  --uastc-level 2  --recompute-tangents  -q
-#   --device <file|-|auto|desktop-1080p|phone|phone-etc2>  --detail low|medium|high|max  --max-triangles N  --json  --print-device
+#   --device <file|-|auto|desktop-1080p|phone|phone-etc2>  --detail low|medium|high|max  --max-triangles N  --max-drawn-triangles N  --json  --print-device
 #   universal only: --etc1s-quality 192  --[no-]uastc-rdo  --zstd
 ```
 
@@ -351,7 +361,7 @@ glTF-loaded meshes have a single level. The HUD shows how many draws used a redu
 
 ### Testing the baker
 
-`npm test` runs `tools/bake/test/*.test.ts`: `.wgm` write/read round trip, v1-file readability,
+`npm test` runs `tools/bake/test/*.test.ts`: `budget.test.ts` bakes one mesh referenced by 1 and by 30 nodes and checks the LOD0 is identical (only the drawn estimate deepens the LOD chain) and that a tight pixel tolerance stops the LOD0 budget reduction; `.wgm` write/read round trip, v1-file readability,
 quantized-stream validation, rejection of corrupt files (magic, truncation, version, LOD and stream
 ranges), LOD invariants, and a full bake of a generated glTF in `rgba8`/full-precision, `bc7`, `astc`,
 `etc2`/low-precision and `universal` modes (uint16 indices, positions decoded from unorm16 land on the
@@ -361,7 +371,7 @@ error bounds, snorm8/16 and octahedral normal/tangent error bounds incl. the tan
 selection vs tolerance and `--vertex-precision`, the native encoders (BC7, ASTC 4x4 and 6x6, ETC2
 RGB/RGBA, RGBA8) and `--texture-format each` / presets through the CLI. `device.test.ts` covers profile
 validation, profile → options (texture format per device, ASTC block, tolerances) for desktop/phone/
-limited GPUs, the presets, the triangle budget, and the CLI's `--json` events, `--device -`, flag
+limited GPUs, the presets, the triangle budgets, and the CLI's `--json` events, `--device -`, flag
 overrides and exit codes. `npm run check:shaders` compiles and builds every shader feature × vertex
 layout variant (float32, quantized snorm8/16, octahedral, absent streams) on SwiftShader.
 
