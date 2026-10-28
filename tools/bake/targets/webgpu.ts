@@ -200,19 +200,23 @@ async function bakeWebgpu(doc: Document, ctx: BakeContext): Promise<BakeOutput> 
   // Primitives with identical geometry (common: one sphere/rock mesh reused with
   // different materials) share vertex streams and index ranges in the file.
   const geometryCache = new Map<string, Omit<WgmPrimitive, 'material'>>();
-  const baseRatio = triangleBudgetRatio(doc, opts.maxTriangles, ctx);
+  const budget = triangleBudget(doc, opts, ctx);
   // Largest texture side each material samples (UV precision is measured in its texels).
   const materialTexSize = materials.map((m) => Math.max(0, ...TEXTURE_SLOTS.map((k) => {
     const ref = m[k];
     return ref ? Math.max(textures[ref.texture].width, textures[ref.texture].height) : 0;
   })));
+  let drawnLod0 = 0, drawnCoarsest = 0;
   for (const mesh of root.listMeshes()) {
     const primitives: WgmPrimitive[] = [];
     const grid = meshGrid(mesh);
+    const copies = budget.instances.get(mesh) ?? 0;
     for (const prim of mesh.listPrimitives()) {
-      const p = await bakePrimitive(prim, materialList, materialTexSize, grid, vertex, index, geometryCache, ctx, baseRatio, stats);
+      const p = await bakePrimitive(prim, materialList, materialTexSize, grid, vertex, index, geometryCache, ctx, budget, stats);
       if (!p) continue;
       primitives.push(p.prim);
+      drawnLod0 += (p.prim.lods[0].indexCount / 3) * copies;
+      drawnCoarsest += (p.prim.lods[p.prim.lods.length - 1].indexCount / 3) * copies;
       if (p.shared) { stats.sharedPrimitives++; continue; }
       stats.vertices += p.prim.vertexCount;
       stats.triangles += p.prim.lods[0].indexCount / 3;
@@ -242,9 +246,16 @@ async function bakeWebgpu(doc: Document, ctx: BakeContext): Promise<BakeOutput> 
   const b = scene ? getBounds(scene) : { min: [0, 0, 0], max: [0, 0, 0] };
   const bounds: WgmBounds = { min: [...b.min] as WgmBounds['min'], max: [...b.max] as WgmBounds['max'] };
 
+  if (budget.lodLevels > opts.lods || opts.maxDrawnTriangles) {
+    ctx.log(`drawn triangles (all instances): ${Math.round(drawnLod0)} at LOD0, ${Math.round(drawnCoarsest)} at the coarsest LOD` +
+      (opts.maxDrawnTriangles ? ` (estimate ${opts.maxDrawnTriangles}; runtime LOD picks per copy)` : ''));
+  }
   const r3 = (v: number) => Math.round(v * 1000) / 1000;
   const finalStats = {
-    ...stats, encodeMs: Math.round(stats.encodeMs), quantizeMs: Math.round(stats.quantizeMs),
+    ...stats,
+    sourceUniqueTriangles: budget.unique, sourceDrawnTriangles: budget.drawn, instances: budget.instanceCount,
+    lod0BudgetRatio: r3(budget.ratio), lodLevels: budget.lodLevels,
+    drawnTrianglesLod0: Math.round(drawnLod0), drawnTrianglesCoarsest: Math.round(drawnCoarsest), encodeMs: Math.round(stats.encodeMs), quantizeMs: Math.round(stats.quantizeMs),
     maxPositionPixelError: r3(stats.maxPositionPixelError), maxNormalErrorDeg: r3(stats.maxNormalErrorDeg), maxUvErrorTexels: r3(stats.maxUvErrorTexels),
   };
   ctx.log(`vertex streams ${stats.vertexBytesF32} B as float32 -> ${stats.vertexBytes} B (${stats.vertexBytesF32 ? ((100 * stats.vertexBytes) / stats.vertexBytesF32).toFixed(0) : 100}%), formats ${JSON.stringify(stats.vertexFormats)}`);
@@ -257,7 +268,7 @@ async function bakeWebgpu(doc: Document, ctx: BakeContext): Promise<BakeOutput> 
       stats: {
         ...finalStats, textureFormat: texMode.kind === 'native' ? texMode.format : 'universal',
         vertexPrecision: opts.vertexPrecision, vertexTolerance: opts.vertexTolerance,
-        lods: opts.lods, maxTriangles: opts.maxTriangles, ...(ctx.device ? { device: ctx.device } : {}),
+        lods: opts.lods, maxTriangles: opts.maxTriangles, maxDrawnTriangles: opts.maxDrawnTriangles, ...(ctx.device ? { device: ctx.device } : {}),
       },
     },
     sections: { vertex: vertex.finish(), index: index.finish(), texture: texture.finish() },
@@ -291,7 +302,7 @@ function meshGrid(mesh: Mesh): { min: number[]; max: number[] } {
 async function bakePrimitive(
   prim: Primitive, materials: Material[], materialTexSize: number[], grid: { min: number[]; max: number[] },
   vertex: SectionBuilder, index: SectionBuilder,
-  cache: Map<string, Omit<WgmPrimitive, 'material'>>, ctx: BakeContext, baseRatio: number, stats: BakeStats,
+  cache: Map<string, Omit<WgmPrimitive, 'material'>>, ctx: BakeContext, budget: TriangleBudget, stats: BakeStats,
 ): Promise<{ prim: WgmPrimitive; shared: boolean } | null> {
   const opts: BakeOptions = ctx.options;
   const pos = prim.getAttribute('POSITION');
@@ -324,7 +335,12 @@ async function bakePrimitive(
 
   const g = await optimizeGeometry(
     { positions: f32(pos)!, normals: f32(nrm)!, uvs: uv, tangents: tan, indices },
-    { levels: opts.lods, ratio: opts.lodRatio, maxError: opts.lodMaxError, baseRatio },
+    {
+      levels: budget.lodLevels, ratio: opts.lodRatio, maxError: opts.lodMaxError, baseRatio: budget.ratio,
+      // LOD0 is never simplified past what the device can display: the position pixel tolerance
+      // with this mesh's bounding diagonal spanning the screen.
+      baseMaxError: lod0ErrorLimit(grid, opts),
+    },
   );
 
   // ---- GPU-native vertex formats, measured against the device tolerance.
@@ -399,28 +415,91 @@ async function bakePrimitive(
   return { prim: { ...geometry, material }, shared: false };
 }
 
-/** Triangles drawn at full detail (mesh instances counted) vs the budget -> uniform LOD0 ratio. */
-function triangleBudgetRatio(doc: Document, budget: number, ctx: BakeContext): number {
-  if (!budget || budget <= 0) return 1;
+interface TriangleBudget {
+  /** Triangles of the scene's unique geometry: each mesh once, identical primitives (same positions + indices) once. */
+  unique: number;
+  /** Triangles drawn at full source detail, every instance counted. */
+  drawn: number;
+  instanceCount: number;
+  /** Nodes referencing each mesh. */
+  instances: Map<Mesh, number>;
+  /** LOD0 reduction ratio from `maxTriangles` over the unique count (1 = none). */
+  ratio: number;
+  /** LOD levels to build (opts.lods, deepened by `maxDrawnTriangles` when needed). */
+  lodLevels: number;
+}
+
+const MAX_LOD_LEVELS = 8;
+
+/**
+ * LOD0 is budgeted on UNIQUE geometry: N instances of one mesh get the same LOD0 as one
+ * instance. Instances only matter for the per-frame drawn estimate, which can only add LOD
+ * levels (runtime LOD selection lowers distant copies), never reduce LOD0.
+ */
+function triangleBudget(doc: Document, opts: BakeOptions, ctx: BakeContext): TriangleBudget {
+  const root = doc.getRoot();
   const instances = new Map<Mesh, number>();
-  for (const n of doc.getRoot().listNodes()) {
+  for (const n of root.listNodes()) {
     const m = n.getMesh();
     if (m) instances.set(m, (instances.get(m) ?? 0) + 1);
   }
-  let drawn = 0;
-  for (const [mesh, count] of instances) {
+  const primTris = (prim: Primitive) => {
+    const idx = prim.getIndices();
+    return (idx ? idx.getCount() : prim.getAttribute('POSITION')?.getCount() ?? 0) / 3;
+  };
+  // Unique: each mesh once, and primitives with identical positions + indices once (by content,
+  // as the geometry cache below stores them once: many files repeat one shape as separate meshes).
+  const seen = new Set<string>();
+  const contentKey = (prim: Primitive) => {
+    const h = createHash('sha1');
+    for (const a of [prim.getAttribute('POSITION')?.getArray(), prim.getIndices()?.getArray()]) {
+      h.update(a ? new Uint8Array(a.buffer, a.byteOffset, a.byteLength) : new Uint8Array(0));
+      h.update(a ? a.constructor.name : '-');
+    }
+    return h.digest('hex');
+  };
+  let unique = 0, drawn = 0, instanceCount = 0;
+  for (const mesh of root.listMeshes()) {
+    const copies = instances.get(mesh) ?? 0;
+    if (!copies) continue;
+    instanceCount += copies;
     for (const prim of mesh.listPrimitives()) {
-      const idx = prim.getIndices();
-      drawn += ((idx ? idx.getCount() : prim.getAttribute('POSITION')?.getCount() ?? 0) / 3) * count;
+      const t = primTris(prim);
+      drawn += t * copies;
+      const key = contentKey(prim);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique += t;
     }
   }
-  if (drawn <= budget) {
-    ctx.log(`triangle budget ${budget}: scene draws ${Math.round(drawn)} triangles, no reduction`);
-    return 1;
+  unique = Math.round(unique); drawn = Math.round(drawn);
+
+  let ratio = 1;
+  if (opts.maxTriangles > 0 && unique > opts.maxTriangles) {
+    ratio = opts.maxTriangles / unique;
+    ctx.log(`LOD0 budget ${opts.maxTriangles} (unique geometry): ${unique} unique triangles, simplifying LOD0 toward ${(ratio * 100).toFixed(1)}% ` +
+      `(stops at ${opts.vertexTolerance.pixelError} px error at ${opts.vertexTolerance.screenPixels} px)`);
+  } else if (opts.maxTriangles > 0) {
+    ctx.log(`LOD0 budget ${opts.maxTriangles} (unique geometry): ${unique} unique triangles, no reduction` +
+      (drawn !== unique ? ` (${drawn} drawn with ${instanceCount} instances; instances do not reduce LOD0)` : ''));
   }
-  const ratio = budget / drawn;
-  ctx.log(`triangle budget ${budget}: scene draws ${Math.round(drawn)} triangles, simplifying LOD0 to ${(ratio * 100).toFixed(1)}%`);
-  return ratio;
+
+  let lodLevels = opts.lods;
+  const drawnLod0 = drawn * ratio;
+  if (opts.maxDrawnTriangles > 0 && drawnLod0 > opts.maxDrawnTriangles && opts.lods > 1 && opts.lodRatio < 1) {
+    const need = Math.ceil(Math.log(opts.maxDrawnTriangles / drawnLod0) / Math.log(opts.lodRatio)) + 1;
+    lodLevels = Math.min(MAX_LOD_LEVELS, Math.max(opts.lods, need));
+    ctx.log(`drawn-triangle estimate ${opts.maxDrawnTriangles}: scene draws ~${Math.round(drawnLod0)} at LOD0 with ${instanceCount} instances; ` +
+      `${lodLevels > opts.lods ? `LOD chain deepened ${opts.lods} -> ${lodLevels} levels` : `${opts.lods} LOD levels already reach it`} (LOD0 unchanged)`);
+  }
+  return { unique, drawn, instanceCount, instances, ratio, lodLevels };
+}
+
+/** Absolute LOD0 simplification limit: pixel tolerance with the mesh's diagonal filling the screen. */
+function lod0ErrorLimit(grid: { min: number[]; max: number[] }, opts: BakeOptions): number {
+  const diag = Math.hypot(grid.max[0] - grid.min[0], grid.max[1] - grid.min[1], grid.max[2] - grid.min[2]);
+  const tol = opts.vertexTolerance;
+  return diag > 0 && tol.screenPixels > 0 ? (tol.pixelError * diag) / tol.screenPixels : 0;
 }
 
 function hasAnyTexture(m: Material): boolean {

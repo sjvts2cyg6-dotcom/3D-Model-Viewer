@@ -31,6 +31,11 @@ export interface LodPolicy {
    * Used for device triangle budgets; the reduced mesh becomes LOD0.
    */
   baseRatio?: number;
+  /**
+   * Error limit for that pre-reduction, in mesh units (absolute). The budget reduction stops
+   * there even if the budget is not reached. Undefined = no limit.
+   */
+  baseMaxError?: number;
 }
 
 function attributeStream(normals: Float32Array, uvs: Float32Array | undefined, count: number) {
@@ -55,8 +60,10 @@ export async function optimizeGeometry(src: SourceGeometry, policy: LodPolicy): 
   if (baseRatio < 1 && lod0.length >= 3 * 16) {
     const { attrs, stride, weights } = attributeStream(src.normals, src.uvs, vertexCountIn);
     const target = Math.max(3, Math.floor((lod0.length * baseRatio) / 3) * 3);
+    const scale = MeshoptSimplifier.getScale(src.positions, 3);
+    const relLimit = policy.baseMaxError !== undefined && scale > 0 ? policy.baseMaxError / scale : 1;
     const [out, relErr] = MeshoptSimplifier.simplifyWithAttributes(
-      lod0, src.positions, 3, attrs, stride, weights, null, target, 1, [],
+      lod0, src.positions, 3, attrs, stride, weights, null, target, relLimit, [],
     );
     if (out.length > 0 && out.length < lod0.length) {
       lod0 = out;

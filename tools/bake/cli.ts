@@ -28,7 +28,10 @@ Options:
                               or a built-in preset (estimates, not measurements): ${listPresets().join(', ')}
                               (also as preset:<name>)
   --detail <level>            low | medium | high | max (default medium; used with --device)
-  --max-triangles <N>         full-detail triangle budget for the drawn scene (0 = unlimited)
+  --max-triangles <N>         LOD0 budget for UNIQUE geometry (each mesh once, instances not counted;
+                              0 = unlimited); never simplifies past the pixel tolerance
+  --max-drawn-triangles <N>   per-frame estimate for the scene as drawn (instances counted; 0 = unlimited);
+                              only adds LOD levels, never changes LOD0
   --lods <N>                  total LOD levels incl. full detail (webgpu default 4; 1 = off)
   --lod-ratio <r>             index-count ratio between LODs (default 0.5)
   --lod-max-error <e>         stop LODs above this relative error (default 0.05)
@@ -92,6 +95,7 @@ function parseArgs(argv: string[]): Args | 'help' {
         detail = d; break;
       }
       case '--max-triangles': overrides.maxTriangles = Math.max(0, Math.floor(num(a, argv[++i]))); break;
+      case '--max-drawn-triangles': overrides.maxDrawnTriangles = Math.max(0, Math.floor(num(a, argv[++i]))); break;
       case '--lods': overrides.lods = Math.max(1, Math.floor(num(a, argv[++i]))); break;
       case '--lod-ratio': overrides.lodRatio = num(a, argv[++i]); break;
       case '--lod-max-error': overrides.lodMaxError = num(a, argv[++i]); break;

@@ -55,6 +55,13 @@ export async function readDeviceProfile(file: string): Promise<DeviceProfile> {
 const TRIANGLE_BUDGET: Record<DeviceProfile['deviceClass'], number> = {
   desktop: 2_000_000, mobile: 300_000, software: 100_000,
 };
+/**
+ * Per-frame drawn triangles (all instances) a device class is assumed to handle at `medium`.
+ * An estimate, not a measurement; it only decides how deep the LOD chain goes.
+ */
+const DRAWN_TRIANGLE_BUDGET: Record<DeviceProfile['deviceClass'], number> = {
+  desktop: 5_000_000, mobile: 750_000, software: 250_000,
+};
 const DETAIL_SCALE: Record<DetailLevel, number> = { low: 0.25, medium: 1, high: 4, max: Infinity };
 /** Texture side relative to the longest physical screen side. */
 const TEXTURE_SCREEN_FACTOR: Record<DetailLevel, number> = { low: 0.5, medium: 1, high: 2, max: Infinity };
@@ -99,7 +106,14 @@ export function deriveOptions(p: DeviceProfile, detail: DetailLevel): DeviceDeri
   // Geometry budget.
   const budget = TRIANGLE_BUDGET[cls] * DETAIL_SCALE[detail];
   options.maxTriangles = Number.isFinite(budget) ? Math.round(budget) : 0;
-  decisions.push(options.maxTriangles ? `triangle budget ${options.maxTriangles} (${cls}, detail ${detail})` : 'no triangle budget (detail max)');
+  decisions.push(options.maxTriangles
+    ? `LOD0 triangle budget ${options.maxTriangles} for unique geometry, instances not counted (${cls}, detail ${detail}; never past the pixel tolerance)`
+    : 'no LOD0 triangle budget (detail max)');
+  const drawnBudget = DRAWN_TRIANGLE_BUDGET[cls] * DETAIL_SCALE[detail];
+  options.maxDrawnTriangles = Number.isFinite(drawnBudget) ? Math.round(drawnBudget) : 0;
+  decisions.push(options.maxDrawnTriangles
+    ? `drawn-triangle estimate ${options.maxDrawnTriangles} per frame, instances counted (only deepens the LOD chain; LOD0 untouched)`
+    : 'no drawn-triangle estimate (detail max)');
 
   // Textures: a native GPU format the device samples directly (no transcode at load).
   const tc = p.gpu.textureCompression;

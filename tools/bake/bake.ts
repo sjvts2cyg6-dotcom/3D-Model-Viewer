@@ -6,7 +6,7 @@ import { TARGETS, type BakeContext, type BakeOptions, type BakeOutput, type Targ
 
 export const BASE_OPTIONS: BakeOptions = {
   lods: 1, lodRatio: 0.5, lodMaxError: 0.05, textureFormat: 'auto', astcBlock: '4x4', astcQuality: 'medium', maxTextureSize: 4096,
-  etc1sQuality: 192, uastcLevel: 2, uastcRdo: false, zstd: false, recomputeTangents: false, maxTriangles: 0,
+  etc1sQuality: 192, uastcLevel: 2, uastcRdo: false, zstd: false, recomputeTangents: false, maxTriangles: 0, maxDrawnTriangles: 0,
   vertexPrecision: 'auto', normalEncoding: 'auto', vertexTolerance: { ...DEFAULT_TOLERANCE },
 };
 

@@ -52,6 +52,8 @@ test('deriveOptions: class, screen, limits and detail drive texture size and tri
   assert.equal(deriveOptions(BASE, 'max').options.vertexTolerance?.normalDegrees, 0.05);
   for (const d of m.decisions) assert.doesNotMatch(d, /transcode|KTX2/i, 'native formats: nothing is transcoded at load');
   assert.equal(deriveOptions(phone, 'low').options.maxTriangles, 75_000);
+  assert.equal(deriveOptions(phone, 'low').options.maxDrawnTriangles, 187_500, 'drawn estimate is separate from the LOD0 budget');
+  assert.equal(deriveOptions(desktop, 'max').options.maxDrawnTriangles, 0);
   assert.equal(deriveOptions(desktop, 'max').options.maxTriangles, 0, 'max = unlimited');
   const limited = variant((p) => { p.deviceClass = 'desktop'; p.gpu.limits.maxTextureDimension2D = 2048; p.platform.deviceMemoryGB = 8; });
   assert.ok(deriveOptions(limited, 'max').options.maxTextureSize! <= 2048, 'never above the device limit');

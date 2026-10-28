@@ -50,10 +50,18 @@ export interface BakeOptions {
   /** Regenerate tangents even when the source provides them. */
   recomputeTangents: boolean;
   /**
-   * Full-detail triangle budget for the whole scene as drawn (instances counted);
-   * 0 = unlimited. Over budget, every primitive's LOD0 is simplified by the same ratio.
+   * LOD0 triangle budget for the scene's UNIQUE geometry: each mesh counted once, however many
+   * nodes instance it, and identical primitives (same positions + indices) once. 0 = unlimited. Over budget, every primitive's LOD0 is simplified by the
+   * same ratio, but never past the position pixel tolerance (`vertexTolerance.pixelError` at
+   * `screenPixels` with the mesh filling the screen): detail the device can display is kept.
    */
   maxTriangles: number;
+  /**
+   * Estimate of the triangles the device can draw per frame for the whole scene (instances
+   * counted). 0 = unlimited. Never changes LOD0; when the scene as drawn at LOD0 exceeds it,
+   * the LOD chain gets more levels so runtime LOD selection can bring distant copies under it.
+   */
+  maxDrawnTriangles: number;
   /** full = float32 streams; auto = smallest GPU format within `vertexTolerance`; low = smallest formats. */
   vertexPrecision: VertexPrecision;
   /** auto = snorm8/16 xyz normals & tangents; oct = octahedral snorm16x2 (decoded in the vertex shader). */
